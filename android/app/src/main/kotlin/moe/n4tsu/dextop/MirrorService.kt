@@ -146,7 +146,7 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         private const val VIRTUAL_TOUCHPAD_MAX_X = 1839
         private const val VIRTUAL_TOUCHPAD_MAX_Y = 1199
         /** Lower resolution makes Android's touchpad acceleration cover more distance. */
-        private const val VIRTUAL_TOUCHPAD_RESOLUTION = 10
+        private const val VIRTUAL_TOUCHPAD_RESOLUTION = 12
         private const val VIRTUAL_TOUCHPAD_TOUCH_MAJOR = 20
         private const val VIRTUAL_TOUCHPAD_PRESSURE = 40
         private const val VIRTUAL_TOUCHPAD_MOVE_LOG_INTERVAL_MS = 250L
