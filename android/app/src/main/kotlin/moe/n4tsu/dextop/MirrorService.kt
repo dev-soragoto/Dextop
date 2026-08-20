@@ -786,6 +786,9 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
     private var rawTouchscreenForwardedFrameCount = 0L
     private var rawTouchscreenLastDiagnosticAt = 0L
     private var rawTouchscreenLastRotation = Surface.ROTATION_0
+    private var rawTouchscreenGestureTarget: RawTouchscreenTarget? = null
+    private val rawTouchscreenAcceptedTrackingIds = mutableSetOf<Int>()
+    private val rawTouchscreenRejectedTrackingIds = mutableSetOf<Int>()
     private val rawMousePreviousContacts = linkedMapOf<Int, MappedRawTouchscreenContact>()
     private var rawMouseGestureDownTime = 0L
     private var rawMouseGestureSequence = 0L
@@ -1692,6 +1695,11 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         val rawY: Int,
         val touchMajor: Int
     )
+
+    private enum class RawTouchscreenTarget(val logName: String) {
+        FULLSCREEN_SURFACE("fullscreen_surface"),
+        LAPTOP_TRACKPAD("laptop_trackpad")
+    }
 
     /** Contact after hit-testing and mapping into the virtual touchpad space. */
     private data class MappedRawTouchscreenContact(
@@ -5534,12 +5542,10 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         }) && !useDirectTouch
         recordTouchRouting(event, useDirectTouch)
         maxPointers = maxOf(maxPointers, event.pointerCount)
-        val rawBridgeOwnsSource = if (laptopModeActive) {
+        val rawBridgeOwnsSource = sourceView === surfaceView ||
             sourceView === laptopTrackpadView
-        } else {
-            sourceView === surfaceView
-        }
-        if (!rawBridgeFrame && rawBridgeOwnsSource && rawTouchscreenBridgeConsumesTouchSurface()) {
+        if (!rawBridgeFrame && rawBridgeOwnsSource &&
+            rawTouchscreenBridgeConsumesTouchSurface(sourceView)) {
             // InputDispatcher may cancel this accessibility-window stream as
             // soon as the virtual touchpad moves the system pointer. The raw
             // EventHub stream remains continuous, so it is the sole producer
@@ -5549,7 +5555,8 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
                 Log.i(
                     logTag,
                     "overlay touch ignored by raw bridge action=${MotionEvent.actionToString(event.action)} " +
-                        "pointers=${event.pointerCount} readerReady=$touchscreenReaderReady"
+                        "pointers=${event.pointerCount} readerReady=$touchscreenReaderReady " +
+                        "surface=${if (sourceView === laptopTrackpadView) "laptop_trackpad" else "fullscreen_surface"}"
                 )
             }
             return true
@@ -7718,8 +7725,16 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
             virtualMouseReady && virtualMouseProcessAlive()
     }
 
-    private fun rawTouchscreenBridgeConsumesTouchSurface(): Boolean =
-        touchscreenReaderRunning && touchscreenReaderReady && rawTouchscreenBridgeEligible()
+    private fun rawTouchscreenBridgeConsumesTouchSurface(sourceView: View? = null): Boolean {
+        if (!touchscreenReaderRunning || !touchscreenReaderReady ||
+            !rawTouchscreenBridgeEligible()) return false
+        return when {
+            sourceView == null -> true
+            sourceView === laptopTrackpadView -> laptopModeActive
+            sourceView === surfaceView -> !directTouch
+            else -> false
+        }
+    }
 
     private fun startRawTouchscreenReaderIfEligible() {
         if (!rawTouchscreenBridgeEligible() || touchscreenReaderRunning) return
@@ -7752,6 +7767,7 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
             rawTouchscreenForwardedFrameCount = 0L
             rawTouchscreenLastDiagnosticAt = 0L
             rawTouchscreenLastRotation = rawTouchscreenDisplayRotation()
+            clearRawTouchscreenGestureTarget("reader_started", logSummary = false)
             rawMousePreviousContacts.clear()
             rawMouseGestureDownTime = 0L
             rawMouseGestureSequence = 0L
@@ -7886,11 +7902,11 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         touchscreenReaderDevice = device
         touchscreenReaderReady = true
         finishRawPointerGesture("raw_touchscreen_activated")
-        val inputSurface = if (laptopModeActive) laptopTrackpadView else surfaceView
-        val surfaceName = if (laptopModeActive) "laptop_trackpad" else "fullscreen_surface"
+        val fullscreenBounds = rawTouchscreenViewBounds(surfaceView)
+        val trackpadBounds = rawTouchscreenViewBounds(laptopTrackpadView)
         val message = "raw touchscreen ready generation=$generation path=$device " +
             "profile=$virtualPointerRegisteredProfile rotation=${rawTouchscreenDisplayRotation()} " +
-            "surface=$surfaceName size=${inputSurface?.width ?: 0}x${inputSurface?.height ?: 0} " +
+            "fullscreenBounds=$fullscreenBounds trackpadBounds=$trackpadBounds " +
             "root=${root?.width ?: 0}x${root?.height ?: 0}"
         OperationLog.i(this, "InputRouting", message)
         Log.i(logTag, message)
@@ -7951,28 +7967,100 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         }
     }
 
+    private fun rawTouchscreenTargetView(target: RawTouchscreenTarget): View? = when (target) {
+        RawTouchscreenTarget.FULLSCREEN_SURFACE -> surfaceView
+        RawTouchscreenTarget.LAPTOP_TRACKPAD -> laptopTrackpadView
+    }
+
+    private fun rawTouchscreenTargetAt(screenX: Int, screenY: Int): RawTouchscreenTarget? {
+        if (laptopModeActive) {
+            val trackpadBounds = rawTouchscreenViewBounds(laptopTrackpadView)
+            val fnBounds = rawTouchscreenViewBounds(laptopFnButton)
+            val menuBounds = rawTouchscreenViewBounds(laptopMenuButton)
+            if (trackpadBounds?.contains(screenX, screenY) == true &&
+                fnBounds?.contains(screenX, screenY) != true &&
+                menuBounds?.contains(screenX, screenY) != true) {
+                return RawTouchscreenTarget.LAPTOP_TRACKPAD
+            }
+        }
+        if (!directTouch && rawTouchscreenViewBounds(surfaceView)?.contains(screenX, screenY) == true) {
+            return RawTouchscreenTarget.FULLSCREEN_SURFACE
+        }
+        return null
+    }
+
+    private fun clearRawTouchscreenGestureTarget(reason: String, logSummary: Boolean = true) {
+        val previous = rawTouchscreenGestureTarget
+        val accepted = rawTouchscreenAcceptedTrackingIds.size
+        val rejected = rawTouchscreenRejectedTrackingIds.size
+        rawTouchscreenGestureTarget = null
+        rawTouchscreenAcceptedTrackingIds.clear()
+        rawTouchscreenRejectedTrackingIds.clear()
+        if (previous != null && logSummary) {
+            val message = "raw touchscreen target released target=${previous.logName} " +
+                "reason=$reason accepted=$accepted rejected=$rejected"
+            OperationLog.i(this, "InputRouting", message)
+            Log.i(logTag, message)
+        }
+    }
+
     private fun mapRawTouchscreenContacts(
         contacts: List<RawTouchscreenContact>
     ): List<MappedRawTouchscreenContact> {
         val frame = root ?: return emptyList()
-        val inputSurface = if (laptopModeActive) laptopTrackpadView else surfaceView
-        val inputBounds = rawTouchscreenViewBounds(inputSurface) ?: return emptyList()
         val rootBounds = rawTouchscreenViewBounds(frame) ?: return emptyList()
-        val fnBounds = if (laptopModeActive) rawTouchscreenViewBounds(laptopFnButton) else null
-        val menuBounds = if (laptopModeActive) rawTouchscreenViewBounds(laptopMenuButton) else null
-        return contacts.mapNotNull { contact ->
+        val screenContacts = contacts.map { contact ->
             val (logicalX, logicalY) = rotateRawTouchscreenPoint(contact.rawX, contact.rawY)
             val screenX = rootBounds.left +
                 (logicalX * (rootBounds.width() - 1).coerceAtLeast(1)).roundToInt()
             val screenY = rootBounds.top +
                 (logicalY * (rootBounds.height() - 1).coerceAtLeast(1)).roundToInt()
-            if (!inputBounds.contains(screenX, screenY) ||
-                fnBounds?.contains(screenX, screenY) == true ||
-                menuBounds?.contains(screenX, screenY) == true) {
+            Triple(contact, screenX, screenY)
+        }
+        if (rawTouchscreenGestureTarget == null) {
+            val firstTarget = screenContacts.firstOrNull()?.let { (_, screenX, screenY) ->
+                rawTouchscreenTargetAt(screenX, screenY)
+            }
+            if (firstTarget != null) {
+                rawTouchscreenGestureTarget = firstTarget
+                val message = "raw touchscreen target latched target=${firstTarget.logName} " +
+                    "profile=$virtualPointerRegisteredProfile rotation=${rawTouchscreenDisplayRotation()} " +
+                    "physicalContacts=${contacts.size}"
+                OperationLog.i(this, "InputRouting", message)
+                Log.i(logTag, message)
+            }
+        }
+        val target = rawTouchscreenGestureTarget ?: return emptyList()
+        val inputBounds = rawTouchscreenViewBounds(rawTouchscreenTargetView(target))
+            ?: return emptyList()
+        val activeIds = contacts.mapTo(mutableSetOf()) { it.trackingId }
+        rawTouchscreenAcceptedTrackingIds.retainAll(activeIds)
+        rawTouchscreenRejectedTrackingIds.retainAll(activeIds)
+        val fnBounds = if (target == RawTouchscreenTarget.LAPTOP_TRACKPAD) {
+            rawTouchscreenViewBounds(laptopFnButton)
+        } else null
+        val menuBounds = if (target == RawTouchscreenTarget.LAPTOP_TRACKPAD) {
+            rawTouchscreenViewBounds(laptopMenuButton)
+        } else null
+        return screenContacts.mapNotNull { (contact, screenX, screenY) ->
+            if (contact.trackingId !in rawTouchscreenAcceptedTrackingIds &&
+                contact.trackingId !in rawTouchscreenRejectedTrackingIds) {
+                val belongsToTarget = inputBounds.contains(screenX, screenY) &&
+                    fnBounds?.contains(screenX, screenY) != true &&
+                    menuBounds?.contains(screenX, screenY) != true
+                if (belongsToTarget) {
+                    rawTouchscreenAcceptedTrackingIds += contact.trackingId
+                } else {
+                    rawTouchscreenRejectedTrackingIds += contact.trackingId
+                }
+            }
+            if (contact.trackingId in rawTouchscreenRejectedTrackingIds) {
                 return@mapNotNull null
             }
-            val localX = (screenX - inputBounds.left).toFloat()
-            val localY = (screenY - inputBounds.top).toFloat()
+            val maxLocalX = (inputBounds.width() - 1).coerceAtLeast(0).toFloat()
+            val maxLocalY = (inputBounds.height() - 1).coerceAtLeast(0).toFloat()
+            val localX = (screenX - inputBounds.left).toFloat().coerceIn(0f, maxLocalX)
+            val localY = (screenY - inputBounds.top).toFloat().coerceIn(0f, maxLocalY)
             val x = (localX /
                 (inputBounds.width() - 1).coerceAtLeast(1) * VIRTUAL_TOUCHPAD_MAX_X)
                 .roundToInt().coerceIn(0, VIRTUAL_TOUCHPAD_MAX_X)
@@ -8003,6 +8091,7 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
             val previousRotation = rawTouchscreenLastRotation
             rawTouchscreenLastRotation = currentRotation
             finishRawPointerGesture("display_rotation_changed")
+            clearRawTouchscreenGestureTarget("display_rotation_changed")
             rawTouchscreenThreeFingerCaptured = false
             rawTouchscreenThreeFingerStartedAt = 0L
             rawTouchscreenThreeFingerPeakContacts = 0
@@ -8017,17 +8106,19 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         val previousPhysicalCount = rawTouchscreenLastPhysicalContactCount
         val previousMappedCount = rawTouchscreenLastMappedContactCount
         rawTouchscreenLastPhysicalContactCount = physicalContacts.size
-        val mappedContacts = mapRawTouchscreenContacts(physicalContacts)
-        rawTouchscreenLastMappedContactCount = mappedContacts.size
 
         if (menu?.visibility == View.VISIBLE) {
             finishRawPointerGesture("raw_menu_visible")
             rawTouchscreenSuppressUntilAllUp = physicalContacts.isNotEmpty()
+            rawTouchscreenLastMappedContactCount = 0
+            if (physicalContacts.isEmpty()) {
+                clearRawTouchscreenGestureTarget("menu_visible_all_up")
+            }
             logRawTouchscreenFrame(
                 previousPhysicalCount,
                 previousMappedCount,
                 physicalContacts,
-                mappedContacts,
+                emptyList(),
                 "menu_visible"
             )
             return
@@ -8036,15 +8127,36 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         if (rawTouchscreenSuppressUntilAllUp) {
             if (physicalContacts.isEmpty()) {
                 rawTouchscreenSuppressUntilAllUp = false
-                OperationLog.i(this, "InputRouting", "raw touchscreen rearmed after menu contacts released")
-                Log.i(logTag, "raw touchscreen rearmed after menu contacts released")
+                clearRawTouchscreenGestureTarget("suppressed_sequence_all_up")
+                OperationLog.i(this, "InputRouting", "raw touchscreen rearmed after excluded contacts released")
+                Log.i(logTag, "raw touchscreen rearmed after excluded contacts released")
             }
+            rawTouchscreenLastMappedContactCount = 0
+            logRawTouchscreenFrame(
+                previousPhysicalCount,
+                previousMappedCount,
+                physicalContacts,
+                emptyList(),
+                "waiting_all_up"
+            )
+            return
+        }
+
+        val mappedContacts = mapRawTouchscreenContacts(physicalContacts)
+        rawTouchscreenLastMappedContactCount = mappedContacts.size
+        if (previousPhysicalCount == 0 && physicalContacts.isNotEmpty() &&
+            rawTouchscreenGestureTarget == null) {
+            rawTouchscreenSuppressUntilAllUp = true
+            val message = "raw touchscreen sequence started outside pointer targets; " +
+                "contacts=${physicalContacts.size} directTouch=$directTouch laptop=$laptopModeActive"
+            OperationLog.i(this, "InputRouting", message)
+            Log.i(logTag, message)
             logRawTouchscreenFrame(
                 previousPhysicalCount,
                 previousMappedCount,
                 physicalContacts,
                 mappedContacts,
-                "waiting_all_up"
+                "outside_pointer_targets"
             )
             return
         }
@@ -8066,6 +8178,7 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
                 OperationLog.i(this, "InputRouting", message)
                 Log.i(logTag, message)
                 performConfiguredGesture()
+                clearRawTouchscreenGestureTarget("three_finger_completed")
             }
             logRawTouchscreenFrame(
                 previousPhysicalCount,
@@ -8104,16 +8217,21 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
             mappedContacts,
             "forwarding"
         )
+        if (physicalContacts.isEmpty()) {
+            clearRawTouchscreenGestureTarget("all_contacts_up")
+        }
     }
 
-    private fun rawMouseSourceView(): View? =
-        if (laptopModeActive) laptopTrackpadView else surfaceView
+    private fun rawMouseSourceView(): View? = rawTouchscreenGestureTarget
+        ?.let(::rawTouchscreenTargetView)
 
     private fun dispatchRawMouseMotionEvent(
         action: Int,
         contacts: List<MappedRawTouchscreenContact>
     ): Boolean {
         val sourceView = rawMouseSourceView() ?: return false
+        val laptopTrackpadTarget =
+            rawTouchscreenGestureTarget == RawTouchscreenTarget.LAPTOP_TRACKPAD
         if (contacts.isEmpty()) return false
         val eventTime = SystemClock.uptimeMillis()
         if (rawMouseGestureDownTime == 0L || action == MotionEvent.ACTION_DOWN) {
@@ -8155,9 +8273,9 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
             trackpad(
                 event,
                 sourceView = sourceView,
-                forceCursorMode = laptopModeActive,
-                allowVirtualPointer = laptopModeActive,
-                hapticView = if (laptopModeActive) sourceView else null,
+                forceCursorMode = laptopTrackpadTarget,
+                allowVirtualPointer = laptopTrackpadTarget,
+                hapticView = if (laptopTrackpadTarget) sourceView else null,
                 rawBridgeFrame = true
             )
         } finally {
@@ -8198,7 +8316,7 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
                 dispatched = dispatchRawMouseMotionEvent(action, working) || dispatched
             }
             val message = "raw mouse gesture started sequence=$rawMouseGestureSequence " +
-                "contacts=${contacts.size} surface=${if (laptopModeActive) "laptop_trackpad" else "fullscreen_surface"} " +
+                "contacts=${contacts.size} target=${rawTouchscreenGestureTarget?.logName ?: "none"} " +
                 "rotation=${rawTouchscreenDisplayRotation()}"
             OperationLog.i(this, "InputRouting", message)
             Log.i(logTag, message)
@@ -8353,10 +8471,9 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         if (!contactCountChanged &&
             now - rawTouchscreenLastDiagnosticAt < RAW_TOUCHSCREEN_DIAGNOSTIC_INTERVAL_MS) return
         rawTouchscreenLastDiagnosticAt = now
-        val surfaceName = if (laptopModeActive) "laptop_trackpad" else "fullscreen_surface"
-        val inputBounds = rawTouchscreenViewBounds(
-            if (laptopModeActive) laptopTrackpadView else surfaceView
-        )
+        val target = rawTouchscreenGestureTarget
+        val surfaceName = target?.logName ?: "none"
+        val inputBounds = target?.let { rawTouchscreenViewBounds(rawTouchscreenTargetView(it)) }
         val physicalSummary = physicalContacts.joinToString(prefix = "[", postfix = "]") {
             "slot=${it.physicalSlot},id=${it.trackingId},raw=${it.rawX}:${it.rawY}"
         }
@@ -8369,7 +8486,9 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
             "sourceFrames=$rawTouchscreenSourceFrameCount forwardedFrames=$rawTouchscreenForwardedFrameCount " +
             "physical=${physicalContacts.size} mapped=${mappedContacts.size} " +
             "virtual=${virtualTouchpadActiveContactCount()} captured=$rawTouchscreenThreeFingerCaptured " +
-            "suppressed=$rawTouchscreenSuppressUntilAllUp surface=$surfaceName bounds=$inputBounds " +
+            "suppressed=$rawTouchscreenSuppressUntilAllUp target=$surfaceName bounds=$inputBounds " +
+            "accepted=${rawTouchscreenAcceptedTrackingIds.size} " +
+            "rejected=${rawTouchscreenRejectedTrackingIds.size} directTouch=$directTouch " +
             "rawContacts=$physicalSummary mappedContacts=$mappedSummary"
         Log.d(logTag, message)
         if (contactCountChanged) OperationLog.i(this, "InputRouting", message)
@@ -8382,6 +8501,7 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         rawTouchscreenThreeFingerPeakContacts = 0
         rawTouchscreenLastPhysicalContactCount = 0
         rawTouchscreenLastMappedContactCount = 0
+        clearRawTouchscreenGestureTarget("gesture_state_reset", logSummary = false)
         rawMousePreviousContacts.clear()
         rawMouseGestureDownTime = 0L
     }
