@@ -98,6 +98,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import moe.shizuku.server.IShizukuService
 import kotlin.math.abs
 import kotlin.math.hypot
+import kotlin.math.roundToInt
 import org.json.JSONArray
 import org.json.JSONObject
 import org.lsposed.hiddenapibypass.HiddenApiBypass
@@ -141,6 +142,18 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         private const val KEY_ROTATE_180_PORTRAIT = "rotate_180_portrait"
         private const val VIRTUAL_MOUSE_NAME = "Dextop Virtual Mouse"
         private const val VIRTUAL_TOUCHPAD_NAME = "Dextop Virtual Touchpad"
+        private const val VIRTUAL_TOUCHPAD_MAX_SLOTS = 5
+        private const val VIRTUAL_TOUCHPAD_MAX_X = 1839
+        private const val VIRTUAL_TOUCHPAD_MAX_Y = 1199
+        private const val VIRTUAL_TOUCHPAD_RESOLUTION = 20
+        private const val VIRTUAL_TOUCHPAD_TOUCH_MAJOR = 20
+        private const val VIRTUAL_TOUCHPAD_PRESSURE = 40
+        private const val VIRTUAL_TOUCHPAD_MOVE_LOG_INTERVAL_MS = 250L
+        /** Fold8 touchscreen reports both raw axes in a stable 0..4095 space. */
+        private const val FOLD8_RAW_TOUCHSCREEN_MAX_X = 4095
+        private const val FOLD8_RAW_TOUCHSCREEN_MAX_Y = 4095
+        private const val RAW_TOUCHSCREEN_MAX_SLOTS = 10
+        private const val RAW_TOUCHSCREEN_DIAGNOSTIC_INTERVAL_MS = 1_000L
         private const val SYSTEM_UI_PACKAGE = "com.android.systemui"
         private const val NOTIFICATION_LAUNCH_WINDOW_MS = 3_000L
         private const val NOTIFICATION_ROUTE_RETRY_DELAY_MS = 140L
@@ -632,6 +645,8 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
     private var laptopFunctionRowVisible = false
     private var laptopKeyboardView: LinearLayout? = null
     private var laptopFnButton: TextView? = null
+    private var laptopMenuButton: TextView? = null
+    private var laptopTrackpadView: View? = null
     private var laptopModeActive = false
     private var laptopManualOverride = false
     private var laptopAutoActivated = false
@@ -658,6 +673,20 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
     private var virtualMouseFractionY = 0f
     private var virtualMouseWheelFractionX = 0f
     private var virtualMouseWheelFractionY = 0f
+    /** Android pointer ids currently occupying Linux multitouch Type-B slots. */
+    private val virtualTouchpadSlotPointerIds =
+        IntArray(VIRTUAL_TOUCHPAD_MAX_SLOTS) { -1 }
+    private val virtualTouchpadSlotTrackingIds =
+        IntArray(VIRTUAL_TOUCHPAD_MAX_SLOTS) { -1 }
+    private var virtualTouchpadNextTrackingId = 1
+    private var virtualTouchpadGestureSequence = 0L
+    private var virtualTouchpadGestureStartedAt = 0L
+    private var virtualTouchpadFrameCount = 0
+    private var virtualTouchpadContactUpdateCount = 0
+    private var virtualTouchpadLastMoveLogAt = 0L
+    private var virtualPointerLastUnsupportedEventLogAt = 0L
+    /** Latches native MT routing at ACTION_DOWN so readiness cannot switch mid-stream. */
+    private var nativeTouchpadGestureActive = false
     private var laptopHostUniqueId: String? = null
     private var laptopShift = false
     private var laptopControl = false
@@ -742,6 +771,20 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         get() = !Build.MANUFACTURER.equals("samsung", ignoreCase = true)
     private var mouseReaderProcess: moe.shizuku.server.IRemoteProcess? = null
     @Volatile private var mouseReaderRunning = false
+    private var touchscreenReaderProcess: moe.shizuku.server.IRemoteProcess? = null
+    @Volatile private var touchscreenReaderRunning = false
+    @Volatile private var touchscreenReaderReady = false
+    private var touchscreenReaderGeneration = 0L
+    private var touchscreenReaderDevice = ""
+    private var rawTouchscreenSuppressUntilAllUp = false
+    private var rawTouchscreenThreeFingerCaptured = false
+    private var rawTouchscreenThreeFingerStartedAt = 0L
+    private var rawTouchscreenThreeFingerPeakContacts = 0
+    private var rawTouchscreenLastPhysicalContactCount = 0
+    private var rawTouchscreenLastMappedContactCount = 0
+    private var rawTouchscreenSourceFrameCount = 0L
+    private var rawTouchscreenForwardedFrameCount = 0L
+    private var rawTouchscreenLastDiagnosticAt = 0L
     private var inputManager: InputManager? = null
     private var sensorManager: SensorManager? = null
     private var hingeAngle: Float? = null
@@ -796,6 +839,7 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
 
     private fun currentInputMode(): String = when {
         physicalMouseActive -> "physical_mouse"
+        rawTouchscreenBridgeConsumesTouchSurface() -> "raw_touchscreen_touchpad"
         laptopTrackpadInputActive() && activeVirtualPointerProfile() == "touchpad" -> "virtual_touchpad"
         laptopTrackpadInputActive() -> "virtual_mouse"
         virtualMouseInputActive() && activeVirtualPointerProfile() == "touchpad" -> "virtual_touchpad"
@@ -1510,7 +1554,7 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
                     forwardMouseEvent(event, this)
                 } else {
                     if (event.actionMasked == MotionEvent.ACTION_DOWN) activateTouchInput()
-                    trackpad(event)
+                    trackpad(event, sourceView = view)
                 }
             }
             setOnGenericMotionListener { _, event ->
@@ -1633,6 +1677,23 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
 
     private data class LaptopKey(val label: String, val code: Int, val weight: Float = 1f)
 
+    /** Immutable snapshot copied from one physical touchscreen SYN_REPORT frame. */
+    private data class RawTouchscreenContact(
+        val physicalSlot: Int,
+        val trackingId: Int,
+        val rawX: Int,
+        val rawY: Int,
+        val touchMajor: Int
+    )
+
+    /** Contact after hit-testing and mapping into the virtual touchpad space. */
+    private data class MappedRawTouchscreenContact(
+        val trackingId: Int,
+        val x: Int,
+        val y: Int,
+        val touchMajor: Int
+    )
+
     private fun buildLaptopDeck(): View {
         laptopModifierButtons.clear()
         laptopShortcutButtons.clear()
@@ -1699,12 +1760,14 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
                 // allowed to disconnect the pointer in that mode.
                 trackpad(
                     event,
+                    sourceView = view,
                     forceCursorMode = true,
                     allowVirtualPointer = true,
                     hapticView = view
                 )
             }
         }
+        laptopTrackpadView = trackpad
         val keyboard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             // Empty space between keys is part of the theme background. It
@@ -1777,6 +1840,7 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
                         toggleMenu()
                     }
                 }
+                laptopMenuButton = this
             }, FrameLayout.LayoutParams(dp(58), dp(42), Gravity.BOTTOM or Gravity.END).apply {
                 rightMargin = dp(10)
                 bottomMargin = dp(10)
@@ -1837,6 +1901,7 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
             if (enabled) {
                 startLaptopHardwareKeyboard()
                 startVirtualMouse()
+                startRawTouchscreenReaderIfEligible()
             }
             return
         }
@@ -1873,6 +1938,7 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         if (enabled) {
             startLaptopHardwareKeyboard()
             startVirtualMouse()
+            startRawTouchscreenReaderIfEligible()
             val deck = buildLaptopDeck().apply {
                 alpha = 0f
                 translationY = dp(28).toFloat()
@@ -1891,6 +1957,11 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
             menu?.bringToFront()
             performanceHud?.bringToFront()
         } else {
+            // Fold8's raw reader also owns the normal full-screen touchpad.
+            // Keep it alive when leaving the deck unless the restored surface
+            // is direct-touch, in which case the physical touchscreen must
+            // continue to behave as a touchscreen instead of a touchpad.
+            if (directTouch) stopRawTouchscreenReader("laptop_mode_disabled_direct_touch")
             stopLaptopHardwareKeyboard()
             // In tap/direct-touch mode the pointer belongs only to the
             // laptop trackpad while the deck is visible. Remove it as soon
@@ -1902,6 +1973,9 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
             }
             val deck = laptopDeck
             laptopDeck = null
+            laptopTrackpadView = null
+            laptopFnButton = null
+            laptopMenuButton = null
             deck?.animate()
                 ?.cancel()
             deck?.animate()
@@ -1990,12 +2064,9 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
     }
 
     /**
-     * Registers the touch cursor as a kernel-backed mouse.  Android's
-     * `uinput` command feeds this device through the normal InputReader path,
-     * which means display topology and pointer focus are handled by the
-     * framework instead of by Dextop's software cursor.  The existing
-     * InputDispatcher/touch path remains the fallback for devices where
-     * `uinput` is missing or rejected.
+     * Registers the selected kernel-backed pointer. The mouse profile reports
+     * relative motion; the touchpad profile exposes Linux MT Type-B contacts
+     * and lets Android's TouchpadInputMapper own acceleration and gestures.
      */
     private fun startVirtualMouse(profileOverride: String? = null) {
         val profile = normalizeVirtualPointerProfile(profileOverride ?: activeVirtualPointerProfile())
@@ -2022,6 +2093,8 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         stopVirtualMouse()
         val binder = rikka.shizuku.Shizuku.getBinder()
         if (binder == null) {
+            OperationLog.w(this, "InputRouting", "virtual pointer registration skipped; Shizuku binder unavailable")
+            Log.w(logTag, "virtual pointer registration skipped: Shizuku binder unavailable profile=$profile")
             updateVirtualCursorVisibility()
             return
         }
@@ -2039,10 +2112,10 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
             val generation = virtualMouseGeneration
             val configuration = if (profile == "touchpad") {
                 """
-                    {"type":"UI_SET_EVBIT","data":["EV_REL","EV_ABS","EV_KEY","EV_SYN"]},
-                    {"type":"UI_SET_RELBIT","data":["REL_X","REL_Y","REL_WHEEL","REL_HWHEEL"]},
-                    {"type":"UI_SET_ABSBIT","data":["ABS_X","ABS_Y"]},
-                    {"type":"UI_SET_KEYBIT","data":["BTN_LEFT","BTN_RIGHT","BTN_MIDDLE","BTN_SIDE","BTN_EXTRA","BTN_TOOL_FINGER","BTN_TOUCH"]}
+                    {"type":"UI_SET_EVBIT","data":["EV_SYN","EV_KEY","EV_ABS"]},
+                    {"type":"UI_SET_KEYBIT","data":["BTN_LEFT","BTN_RIGHT","BTN_TOUCH"]},
+                    {"type":"UI_SET_ABSBIT","data":["ABS_MT_SLOT","ABS_MT_TOUCH_MAJOR","ABS_MT_POSITION_X","ABS_MT_POSITION_Y","ABS_MT_TRACKING_ID","ABS_MT_PRESSURE"]},
+                    {"type":"UI_SET_PROPBIT","data":["INPUT_PROP_POINTER","INPUT_PROP_BUTTONPAD"]}
                 """.trimIndent()
             } else {
                 """
@@ -2054,8 +2127,12 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
             val absInfo = if (profile == "touchpad") {
                 """,
                   "abs_info": [
-                    {"code":"ABS_X","info":{"value":0,"minimum":0,"maximum":${(targetWidth - 1).coerceAtLeast(1)},"fuzz":0,"flat":0,"resolution":1}},
-                    {"code":"ABS_Y","info":{"value":0,"minimum":0,"maximum":${(targetHeight - 1).coerceAtLeast(1)},"fuzz":0,"flat":0,"resolution":1}}
+                    {"code":"ABS_MT_SLOT","info":{"value":0,"minimum":0,"maximum":${VIRTUAL_TOUCHPAD_MAX_SLOTS - 1},"fuzz":0,"flat":0,"resolution":0}},
+                    {"code":"ABS_MT_TOUCH_MAJOR","info":{"value":0,"minimum":0,"maximum":255,"fuzz":0,"flat":0,"resolution":0}},
+                    {"code":"ABS_MT_POSITION_X","info":{"value":0,"minimum":0,"maximum":$VIRTUAL_TOUCHPAD_MAX_X,"fuzz":0,"flat":0,"resolution":$VIRTUAL_TOUCHPAD_RESOLUTION}},
+                    {"code":"ABS_MT_POSITION_Y","info":{"value":0,"minimum":0,"maximum":$VIRTUAL_TOUCHPAD_MAX_Y,"fuzz":0,"flat":0,"resolution":$VIRTUAL_TOUCHPAD_RESOLUTION}},
+                    {"code":"ABS_MT_TRACKING_ID","info":{"value":0,"minimum":0,"maximum":65535,"fuzz":0,"flat":0,"resolution":0}},
+                    {"code":"ABS_MT_PRESSURE","info":{"value":0,"minimum":0,"maximum":255,"fuzz":0,"flat":0,"resolution":0}}
                   ]
                 """.trimIndent()
             } else {
@@ -2081,7 +2158,18 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
             // uinput process as success; otherwise the first gestures are
             // silently lost on slower/vendor builds.
             scheduleVirtualMouseReadyCheck(generation, profile, 0)
-            OperationLog.i(this, "InputRouting", "registered virtual pointer profile=$profile")
+            val descriptorSummary = if (profile == "touchpad") {
+                "mtSlots=$VIRTUAL_TOUCHPAD_MAX_SLOTS range=${VIRTUAL_TOUCHPAD_MAX_X + 1}x${VIRTUAL_TOUCHPAD_MAX_Y + 1} " +
+                    "resolution=$VIRTUAL_TOUCHPAD_RESOLUTION props=POINTER|BUTTONPAD"
+            } else {
+                "relativeAxes=XY|WHEEL|HWHEEL"
+            }
+            OperationLog.i(
+                this,
+                "InputRouting",
+                "registered virtual pointer profile=$profile generation=$generation $descriptorSummary"
+            )
+            Log.i(logTag, "registered virtual pointer profile=$profile generation=$generation $descriptorSummary")
         }.onFailure { error ->
             stopVirtualMouse()
             OperationLog.w(this, "InputRouting", "virtual mouse registration failed; using software cursor", error)
@@ -2090,6 +2178,17 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
     }
 
     private fun stopVirtualMouse() {
+        val stoppedProfile = virtualPointerRegisteredProfile
+        val stoppedDeviceId = virtualMouseDeviceId
+        val activeContacts = virtualTouchpadActiveContactCount()
+        stopRawTouchscreenReader("virtual_pointer_stopped")
+        if (stoppedProfile.isNotBlank()) {
+            Log.i(
+                logTag,
+                "stopping virtual pointer profile=$stoppedProfile deviceId=$stoppedDeviceId " +
+                    "ready=$virtualMouseReady activeContacts=$activeContacts generation=$virtualMouseGeneration"
+            )
+        }
         virtualMouseGeneration += 1
         virtualMouseReady = false
         virtualMouseDeviceId = -1
@@ -2102,6 +2201,7 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         virtualMouseFractionY = 0f
         virtualMouseWheelFractionX = 0f
         virtualMouseWheelFractionY = 0f
+        resetVirtualTouchpadState("pointer_stopped", logSummary = activeContacts > 0)
     }
 
     private fun scheduleVirtualMouseReadyCheck(generation: Long, profile: String, attempt: Int) {
@@ -2119,13 +2219,24 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
                 virtualMouseDeviceId = device.id
                 virtualMouseReady = true
                 updateVirtualCursorVisibility()
+                val deviceDetails = virtualPointerDeviceDetails(device)
                 OperationLog.i(
                     this,
                     "InputRouting",
                     "virtual pointer ready profile=$profile deviceId=${device.id}; framework routing active " +
                         displayGeometrySnapshot("virtual_mouse_ready")
                 )
+                Log.i(logTag, "virtual pointer ready profile=$profile $deviceDetails")
+                if (profile == "touchpad") startRawTouchscreenReaderIfEligible()
                 return@Runnable
+            }
+            if (attempt == 0 || attempt == 5 || attempt == 10 || attempt == 15) {
+                val candidates = virtualPointerPublicationCandidates(profile)
+                Log.i(
+                    logTag,
+                    "waiting for InputReader profile=$profile attempt=$attempt/15 generation=$generation " +
+                        "candidates=$candidates"
+                )
             }
             if (attempt < 15) {
                 scheduleVirtualMouseReadyCheck(generation, profile, attempt + 1)
@@ -2133,7 +2244,12 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
                 OperationLog.w(
                     this,
                     "InputRouting",
-                    "uinput profile=$profile was not published by InputReader"
+                    "uinput profile=$profile was not published by InputReader after ${attempt + 1} probes"
+                )
+                Log.w(
+                    logTag,
+                    "uinput profile=$profile was not published by InputReader; " +
+                        "candidates=${virtualPointerPublicationCandidates(profile)}"
                 )
                 stopVirtualMouse()
                 if (profile == "touchpad") {
@@ -2165,6 +2281,33 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
                 else -> device.sources and InputDevice.SOURCE_MOUSE == InputDevice.SOURCE_MOUSE
             }
         }
+
+    private fun virtualPointerPublicationCandidates(profile: String): String {
+        val expectedName = virtualPointerDeviceName(profile)
+        val candidates = InputDevice.getDeviceIds().asSequence()
+            .mapNotNull { id ->
+                InputDevice.getDevice(id)?.takeIf { device ->
+                    device.name == expectedName || device.name.startsWith("Dextop Virtual")
+                }
+            }
+            .toList()
+        return if (candidates.isEmpty()) {
+            "none"
+        } else {
+            candidates.joinToString(prefix = "[", postfix = "]") { device ->
+                "id=${device.id},name=${device.name},sources=0x${device.sources.toString(16)}"
+            }
+        }
+    }
+
+    private fun virtualPointerDeviceDetails(device: InputDevice): String {
+        val ranges = device.motionRanges.joinToString(prefix = "[", postfix = "]") { range ->
+            "axis=${MotionEvent.axisToString(range.axis)},min=${range.min},max=${range.max}," +
+                "resolution=${range.resolution},source=0x${range.source.toString(16)}"
+        }
+        return "deviceId=${device.id} name=${device.name} sources=0x${device.sources.toString(16)} " +
+            "external=${device.isExternal} ranges=$ranges"
+    }
 
     private fun applyVirtualPointerProfile(requested: String) {
         val profile = normalizeVirtualPointerProfile(requested)
@@ -2202,11 +2345,352 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
             }
             true
         }.onFailure { error ->
+            val failedProfile = virtualPointerRegisteredProfile
+            val activeContacts = virtualTouchpadActiveContactCount()
             virtualMouseReady = false
             stopVirtualMouse()
             updateVirtualCursorVisibility()
-            OperationLog.w(this, "InputRouting", "virtual mouse event rejected; falling back", error)
+            OperationLog.w(
+                this,
+                "InputRouting",
+                "virtual pointer command rejected profile=$failedProfile activeContacts=$activeContacts; falling back",
+                error
+            )
+            Log.w(
+                logTag,
+                "virtual pointer command rejected profile=$failedProfile activeContacts=$activeContacts",
+                error
+            )
         }.getOrDefault(false)
+    }
+
+    private fun virtualTouchpadActiveContactCount(): Int =
+        virtualTouchpadSlotPointerIds.count { it >= 0 }
+
+    private fun resetVirtualTouchpadState(reason: String, logSummary: Boolean = false) {
+        if (logSummary) {
+            val duration = if (virtualTouchpadGestureStartedAt > 0L) {
+                (SystemClock.uptimeMillis() - virtualTouchpadGestureStartedAt).coerceAtLeast(0L)
+            } else {
+                0L
+            }
+            Log.i(
+                logTag,
+                "touchpad gesture reset reason=$reason sequence=$virtualTouchpadGestureSequence " +
+                    "durationMs=$duration frames=$virtualTouchpadFrameCount " +
+                    "contactUpdates=$virtualTouchpadContactUpdateCount " +
+                    "activeContacts=${virtualTouchpadActiveContactCount()}"
+            )
+        }
+        virtualTouchpadSlotPointerIds.fill(-1)
+        virtualTouchpadSlotTrackingIds.fill(-1)
+        virtualTouchpadGestureStartedAt = 0L
+        virtualTouchpadFrameCount = 0
+        virtualTouchpadContactUpdateCount = 0
+        virtualTouchpadLastMoveLogAt = 0L
+        nativeTouchpadGestureActive = false
+    }
+
+    private fun allocateVirtualTouchpadSlot(pointerId: Int): Int? {
+        val existing = virtualTouchpadSlotPointerIds.indexOf(pointerId)
+        if (existing >= 0) return existing
+        val slot = virtualTouchpadSlotPointerIds.indexOfFirst { it < 0 }
+        if (slot < 0) {
+            OperationLog.w(
+                this,
+                "InputRouting",
+                "touchpad slot allocation failed pointerId=$pointerId maxSlots=$VIRTUAL_TOUCHPAD_MAX_SLOTS"
+            )
+            Log.w(
+                logTag,
+                "touchpad slot allocation failed pointerId=$pointerId " +
+                    "slots=${virtualTouchpadSlotPointerIds.contentToString()}"
+            )
+            return null
+        }
+        val trackingId = virtualTouchpadNextTrackingId
+        virtualTouchpadNextTrackingId = if (trackingId >= 65534) 1 else trackingId + 1
+        virtualTouchpadSlotPointerIds[slot] = pointerId
+        virtualTouchpadSlotTrackingIds[slot] = trackingId
+        return slot
+    }
+
+    private fun virtualTouchpadPosition(
+        event: MotionEvent,
+        pointerIndex: Int,
+        sourceView: View
+    ): Pair<Int, Int>? {
+        if (sourceView.width <= 0 || sourceView.height <= 0) {
+            OperationLog.w(
+                this,
+                "InputRouting",
+                "touchpad event dropped because source surface has invalid size " +
+                    "width=${sourceView.width} height=${sourceView.height}"
+            )
+            Log.w(
+                logTag,
+                "touchpad event dropped: invalid source size ${sourceView.width}x${sourceView.height}"
+            )
+            return null
+        }
+        val x = (event.getX(pointerIndex) / sourceView.width.toFloat() * VIRTUAL_TOUCHPAD_MAX_X)
+            .roundToInt().coerceIn(0, VIRTUAL_TOUCHPAD_MAX_X)
+        val y = (event.getY(pointerIndex) / sourceView.height.toFloat() * VIRTUAL_TOUCHPAD_MAX_Y)
+            .roundToInt().coerceIn(0, VIRTUAL_TOUCHPAD_MAX_Y)
+        return x to y
+    }
+
+    private fun appendVirtualTouchpadContact(
+        events: MutableList<Any>,
+        event: MotionEvent,
+        pointerIndex: Int,
+        sourceView: View,
+        includeTrackingId: Boolean
+    ): Boolean {
+        val pointerId = event.getPointerId(pointerIndex)
+        val slot = allocateVirtualTouchpadSlot(pointerId) ?: return false
+        val position = virtualTouchpadPosition(event, pointerIndex, sourceView) ?: return false
+        events += "EV_ABS"; events += "ABS_MT_SLOT"; events += slot
+        if (includeTrackingId) {
+            events += "EV_ABS"; events += "ABS_MT_TRACKING_ID"
+            events += virtualTouchpadSlotTrackingIds[slot]
+        }
+        events += "EV_ABS"; events += "ABS_MT_POSITION_X"; events += position.first
+        events += "EV_ABS"; events += "ABS_MT_POSITION_Y"; events += position.second
+        events += "EV_ABS"; events += "ABS_MT_TOUCH_MAJOR"; events += VIRTUAL_TOUCHPAD_TOUCH_MAJOR
+        events += "EV_ABS"; events += "ABS_MT_PRESSURE"; events += VIRTUAL_TOUCHPAD_PRESSURE
+        virtualTouchpadContactUpdateCount += 1
+        return true
+    }
+
+    private fun finishVirtualTouchpadGesture(
+        reason: String,
+        allowDirectTouch: Boolean,
+        sendToDevice: Boolean = true
+    ): Boolean {
+        val activeSlots = virtualTouchpadSlotPointerIds.indices
+            .filter { virtualTouchpadSlotPointerIds[it] >= 0 }
+        val sequence = virtualTouchpadGestureSequence
+        val frames = virtualTouchpadFrameCount
+        val updates = virtualTouchpadContactUpdateCount
+        val startedAt = virtualTouchpadGestureStartedAt
+        val events = mutableListOf<Any>()
+        activeSlots.forEach { slot ->
+            events += "EV_ABS"; events += "ABS_MT_SLOT"; events += slot
+            events += "EV_ABS"; events += "ABS_MT_TRACKING_ID"; events += -1
+        }
+        if (activeSlots.isNotEmpty()) {
+            events += "EV_KEY"; events += "BTN_TOUCH"; events += 0
+            events += "EV_SYN"; events += "SYN_REPORT"; events += 0
+        }
+        val sent = activeSlots.isEmpty() || !sendToDevice ||
+            virtualTouchpadEvents(events, allowDirectTouch)
+        resetVirtualTouchpadState(reason)
+        val duration = if (startedAt > 0L) {
+            (SystemClock.uptimeMillis() - startedAt).coerceAtLeast(0L)
+        } else {
+            0L
+        }
+        val summary = "touchpad gesture finished reason=$reason sequence=$sequence durationMs=$duration " +
+            "frames=$frames contactUpdates=$updates releasedSlots=${activeSlots.joinToString()} sent=$sent"
+        OperationLog.i(this, "InputRouting", summary)
+        Log.i(logTag, summary)
+        return sent
+    }
+
+    private fun virtualTouchpadEvents(
+        events: List<Any>,
+        allowDirectTouch: Boolean
+    ): Boolean {
+        if (virtualPointerRegisteredProfile != "touchpad") {
+            Log.w(
+                logTag,
+                "touchpad frame rejected: registeredProfile=$virtualPointerRegisteredProfile " +
+                    "eventTriples=${events.size / 3}"
+            )
+            return false
+        }
+        return virtualMouseEvents(events, allowDirectTouch)
+    }
+
+    /** Bridges an Android MotionEvent to a Linux multitouch Type-B frame. */
+    private fun virtualTouchpadMotionEvent(
+        event: MotionEvent,
+        sourceView: View,
+        allowDirectTouch: Boolean
+    ): Boolean {
+        if (!virtualPointerInputActive(allowDirectTouch) ||
+            virtualPointerRegisteredProfile != "touchpad") {
+            Log.w(
+                logTag,
+                "touchpad event unavailable action=${MotionEvent.actionToString(event.action)} " +
+                    "ready=$virtualMouseReady processAlive=${virtualMouseProcessAlive()} " +
+                    "registeredProfile=$virtualPointerRegisteredProfile"
+            )
+            resetVirtualTouchpadState("pointer_unavailable", logSummary = true)
+            return false
+        }
+        val action = event.actionMasked
+        if (action == MotionEvent.ACTION_CANCEL) {
+            return finishVirtualTouchpadGesture("action_cancel", allowDirectTouch)
+        }
+        if (action == MotionEvent.ACTION_DOWN) {
+            if (virtualTouchpadActiveContactCount() > 0) {
+                finishVirtualTouchpadGesture("unexpected_action_down", allowDirectTouch)
+            }
+            virtualTouchpadGestureSequence += 1
+            virtualTouchpadGestureStartedAt = SystemClock.uptimeMillis()
+            virtualTouchpadFrameCount = 0
+            virtualTouchpadContactUpdateCount = 0
+        }
+
+        val events = mutableListOf<Any>()
+        var finishReason: String? = null
+        when (action) {
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                val wasEmpty = virtualTouchpadActiveContactCount() == 0
+                val actionIndex = event.actionIndex
+                if (!appendVirtualTouchpadContact(
+                        events,
+                        event,
+                        actionIndex,
+                        sourceView,
+                        includeTrackingId = true
+                    )) {
+                    finishVirtualTouchpadGesture("contact_down_failed", allowDirectTouch)
+                    return false
+                }
+                if (wasEmpty) {
+                    events += "EV_KEY"; events += "BTN_TOUCH"; events += 1
+                }
+                val pointerId = event.getPointerId(actionIndex)
+                val slot = virtualTouchpadSlotPointerIds.indexOf(pointerId)
+                val position = virtualTouchpadPosition(event, actionIndex, sourceView)
+                val message = "touchpad contact down sequence=$virtualTouchpadGestureSequence " +
+                    "pointerId=$pointerId slot=$slot trackingId=${virtualTouchpadSlotTrackingIds[slot]} " +
+                    "position=$position pointers=${event.pointerCount} source=${sourceView.width}x${sourceView.height}"
+                OperationLog.i(
+                    this,
+                    "InputRouting",
+                    "touchpad contact down sequence=$virtualTouchpadGestureSequence pointerId=$pointerId " +
+                        "slot=$slot trackingId=${virtualTouchpadSlotTrackingIds[slot]} " +
+                        "pointers=${event.pointerCount}"
+                )
+                Log.i(logTag, message)
+            }
+            MotionEvent.ACTION_MOVE -> {
+                for (index in 0 until event.pointerCount) {
+                    val pointerId = event.getPointerId(index)
+                    val isNewContact = virtualTouchpadSlotPointerIds.indexOf(pointerId) < 0
+                    if (!appendVirtualTouchpadContact(
+                            events,
+                            event,
+                            index,
+                            sourceView,
+                            includeTrackingId = isNewContact
+                        )) {
+                        finishVirtualTouchpadGesture("contact_move_failed", allowDirectTouch)
+                        return false
+                    }
+                    if (isNewContact) {
+                        Log.w(logTag, "touchpad recovered missing contact pointerId=$pointerId during MOVE")
+                    }
+                }
+            }
+            MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_UP -> {
+                val actionIndex = event.actionIndex
+                for (index in 0 until event.pointerCount) {
+                    if (index == actionIndex) continue
+                    if (!appendVirtualTouchpadContact(
+                            events,
+                            event,
+                            index,
+                            sourceView,
+                            includeTrackingId = false
+                        )) {
+                        finishVirtualTouchpadGesture("contact_up_update_failed", allowDirectTouch)
+                        return false
+                    }
+                }
+                val pointerId = event.getPointerId(actionIndex)
+                val slot = virtualTouchpadSlotPointerIds.indexOf(pointerId)
+                if (slot >= 0) {
+                    events += "EV_ABS"; events += "ABS_MT_SLOT"; events += slot
+                    events += "EV_ABS"; events += "ABS_MT_TRACKING_ID"; events += -1
+                    virtualTouchpadSlotPointerIds[slot] = -1
+                    virtualTouchpadSlotTrackingIds[slot] = -1
+                } else {
+                    Log.w(logTag, "touchpad contact up missing pointerId=$pointerId")
+                }
+                if (virtualTouchpadActiveContactCount() == 0) {
+                    events += "EV_KEY"; events += "BTN_TOUCH"; events += 0
+                    finishReason = if (action == MotionEvent.ACTION_UP) "action_up" else "last_pointer_up"
+                }
+                OperationLog.i(
+                    this,
+                    "InputRouting",
+                    "touchpad contact up sequence=$virtualTouchpadGestureSequence pointerId=$pointerId " +
+                        "slot=$slot remaining=${virtualTouchpadActiveContactCount()}"
+                )
+                Log.i(
+                    logTag,
+                    "touchpad contact up sequence=$virtualTouchpadGestureSequence pointerId=$pointerId " +
+                        "slot=$slot remaining=${virtualTouchpadActiveContactCount()}"
+                )
+            }
+            else -> return true
+        }
+        events += "EV_SYN"; events += "SYN_REPORT"; events += 0
+        val sent = virtualTouchpadEvents(events, allowDirectTouch)
+        if (!sent) {
+            Log.w(
+                logTag,
+                "touchpad frame send failed action=${MotionEvent.actionToString(event.action)} " +
+                    "sequence=$virtualTouchpadGestureSequence triples=${events.size / 3}"
+            )
+            resetVirtualTouchpadState("frame_send_failed", logSummary = true)
+            return false
+        }
+        virtualTouchpadFrameCount += 1
+        if (action == MotionEvent.ACTION_MOVE) {
+            val now = SystemClock.uptimeMillis()
+            if (now - virtualTouchpadLastMoveLogAt >= VIRTUAL_TOUCHPAD_MOVE_LOG_INTERVAL_MS) {
+                virtualTouchpadLastMoveLogAt = now
+                val contacts = (0 until event.pointerCount).joinToString(prefix = "[", postfix = "]") { index ->
+                    val pointerId = event.getPointerId(index)
+                    val slot = virtualTouchpadSlotPointerIds.indexOf(pointerId)
+                    val position = virtualTouchpadPosition(event, index, sourceView)
+                    "pointerId=$pointerId,slot=$slot,position=$position"
+                }
+                Log.d(
+                    logTag,
+                    "touchpad move sequence=$virtualTouchpadGestureSequence frame=$virtualTouchpadFrameCount " +
+                        "pointers=${event.pointerCount} contacts=$contacts"
+                )
+            }
+        }
+        if (finishReason != null) {
+            val sequence = virtualTouchpadGestureSequence
+            val frames = virtualTouchpadFrameCount
+            val updates = virtualTouchpadContactUpdateCount
+            val duration = (SystemClock.uptimeMillis() - virtualTouchpadGestureStartedAt)
+                .coerceAtLeast(0L)
+            resetVirtualTouchpadState(finishReason)
+            val summary = "touchpad gesture finished reason=$finishReason sequence=$sequence " +
+                "durationMs=$duration frames=$frames contactUpdates=$updates releasedSlots=event sent=true"
+            OperationLog.i(this, "InputRouting", summary)
+            Log.i(logTag, summary)
+        }
+        return true
+    }
+
+    private fun logSuppressedRelativeTouchpadEvent(kind: String) {
+        val now = SystemClock.uptimeMillis()
+        if (now - virtualPointerLastUnsupportedEventLogAt < 1_000L) return
+        virtualPointerLastUnsupportedEventLogAt = now
+        val message = "suppressed $kind for native touchpad profile; MT contacts must own motion and scrolling"
+        OperationLog.w(this, "InputRouting", message)
+        Log.w(logTag, message)
     }
 
     private fun virtualMouseEvents(
@@ -2233,6 +2717,10 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         allowDirectTouch: Boolean = false
     ): Boolean {
         if (!virtualPointerInputActive(allowDirectTouch)) return false
+        if (virtualPointerRegisteredProfile == "touchpad") {
+            logSuppressedRelativeTouchpadEvent("REL_X/REL_Y movement")
+            return false
+        }
         virtualMouseFractionX += dx
         virtualMouseFractionY += dy
         val x = virtualMouseFractionX.toInt()
@@ -2263,6 +2751,10 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         )
 
     private fun virtualMouseScroll(delta: Float, allowDirectTouch: Boolean = false): Boolean {
+        if (virtualPointerRegisteredProfile == "touchpad") {
+            logSuppressedRelativeTouchpadEvent("REL_WHEEL scrolling")
+            return false
+        }
         val direction = if (virtualMouseNaturalScroll()) 1f else -1f
         // Keep the proven wheel quantization.  Sending steps too frequently
         // makes Android render the scroll as visible bursts rather than a
@@ -2282,6 +2774,10 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         delta: Float,
         allowDirectTouch: Boolean = false
     ): Boolean {
+        if (virtualPointerRegisteredProfile == "touchpad") {
+            logSuppressedRelativeTouchpadEvent("REL_HWHEEL scrolling")
+            return false
+        }
         val direction = if (virtualMouseNaturalScroll()) 1f else -1f
         // REL_HWHEEL follows the same selected direction as vertical scroll.
         virtualMouseWheelFractionX += delta * direction / dp(12).toFloat()
@@ -5013,6 +5509,7 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
 
     private fun trackpad(
         event: MotionEvent,
+        sourceView: View,
         forceCursorMode: Boolean = false,
         allowVirtualPointer: Boolean = false,
         hapticView: View? = null
@@ -5025,9 +5522,76 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         }) && !useDirectTouch
         recordTouchRouting(event, useDirectTouch)
         maxPointers = maxOf(maxPointers, event.pointerCount)
-        if (experimentalMultiTouch && handleExperimentalEdgeGesture(event)) return true
+        val rawBridgeOwnsSource = if (laptopModeActive) {
+            sourceView === laptopTrackpadView
+        } else {
+            sourceView === surfaceView
+        }
+        if (rawBridgeOwnsSource && rawTouchscreenBridgeConsumesTouchSurface()) {
+            // InputDispatcher may cancel this accessibility-window stream as
+            // soon as the virtual touchpad moves the system pointer. The raw
+            // EventHub stream remains continuous, so it is the sole producer
+            // for this gesture and the overlay must never duplicate frames.
+            if (event.actionMasked == MotionEvent.ACTION_DOWN ||
+                event.actionMasked == MotionEvent.ACTION_CANCEL) {
+                Log.i(
+                    logTag,
+                    "overlay touch ignored by raw bridge action=${MotionEvent.actionToString(event.action)} " +
+                        "pointers=${event.pointerCount} readerReady=$touchscreenReaderReady"
+                )
+            }
+            return true
+        }
+        val nativeTouchpadAvailable = useVirtualMouse &&
+            virtualPointerRegisteredProfile == "touchpad"
+        if (experimentalMultiTouch && !nativeTouchpadAvailable &&
+            handleExperimentalEdgeGesture(event)) {
+            if (nativeTouchpadGestureActive || virtualTouchpadActiveContactCount() > 0) {
+                finishVirtualTouchpadGesture(
+                    "dextop_edge_gesture_intercept",
+                    allowVirtualPointer
+                )
+            }
+            return true
+        }
         if (useDirectTouch && experimentalMultiTouch) {
             injectDirectTouch(event)
+            return true
+        }
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+            nativeTouchpadGestureActive = nativeTouchpadAvailable
+            if (nativeTouchpadGestureActive) {
+                moved = false
+                twoFinger = false
+                threeFinger = false
+                scrolling = false
+                maxPointers = 1
+                longPressTriggered = false
+                longPressRunnable?.let { root?.removeCallbacks(it) }
+                longPressRunnable = null
+            }
+        }
+        if (nativeTouchpadGestureActive) {
+            // Dextop's configured three-finger command remains an application
+            // gesture. End the two-contact stream before intercepting the
+            // third finger so InputReader never retains a ghost contact.
+            if (event.actionMasked == MotionEvent.ACTION_POINTER_DOWN &&
+                event.pointerCount >= 3) {
+                threeFinger = true
+                moved = true
+                finishVirtualTouchpadGesture("dextop_three_finger_intercept", allowVirtualPointer)
+                OperationLog.i(
+                    this,
+                    "InputRouting",
+                    "native touchpad stream handed to Dextop three-finger gesture"
+                )
+                Log.i(logTag, "native touchpad stream handed to Dextop three-finger gesture")
+                return true
+            }
+            // Tap, pointer acceleration, and two-finger scrolling are all
+            // interpreted by Android's TouchpadInputMapper from these contacts.
+            // Do not run Dextop's click or REL wheel paths as well.
+            virtualTouchpadMotionEvent(event, sourceView, allowVirtualPointer)
             return true
         }
         when (event.actionMasked) {
@@ -5144,7 +5708,12 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
                 if (completedDirectTouch) {
                     Unit
                 } else if (threeFinger || maxPointers >= 3) {
-                    if (!experimentalMultiTouch) performConfiguredGesture()
+                    // A real touchpad profile has already bypassed the legacy
+                    // edge recognizer above. Always retain Dextop's configured
+                    // three-finger action as the emergency menu/exit path.
+                    if (!experimentalMultiTouch || nativeTouchpadAvailable) {
+                        performConfiguredGesture()
+                    }
                 } else if (longPressTriggered && dragHeld) {
                     if (useVirtualMouse) {
                         virtualMouseButton("BTN_LEFT", false, allowVirtualPointer)
@@ -6103,6 +6672,9 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         longPressRunnable?.let { root?.removeCallbacks(it) }
         longPressRunnable = null
 
+        if (virtualTouchpadActiveContactCount() > 0) {
+            finishVirtualTouchpadGesture("desktop_touch_stream_cancelled", allowDirectTouch = true)
+        }
         if (injectedDirectTouchActive) cancelInjectedDirectTouch()
         if (targetDisplayId >= 0 && (directTouchHeld || scrolling || dragHeld) &&
             !virtualMouseInputActive()) {
@@ -7114,6 +7686,500 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
 
     private fun stopHostDisplayMonitor() {
         hostDisplayMonitorHandler.removeCallbacks(hostDisplayMonitor)
+    }
+
+    /**
+     * Fold8's InputDispatcher cancels the accessibility-window MotionEvent
+     * stream after the uinput touchpad starts moving the framework pointer.
+     * EventHub continues to receive the physical sec_touchscreen frames, so
+     * use that lower-level stream only for this known device/profile pair.
+     * The failure is not limited to laptop mode: the full-screen cursor
+     * surface receives the same cancellation after a few pixels of motion.
+     */
+    private fun rawTouchscreenBridgeEligible(): Boolean =
+        active && (laptopModeActive || !directTouch) &&
+            laptopFoldProfile() == LaptopFoldProfile.FOLD8 &&
+            activeVirtualPointerProfile() == "touchpad" &&
+            virtualPointerRegisteredProfile == "touchpad" &&
+            virtualMouseReady && virtualMouseProcessAlive()
+
+    private fun rawTouchscreenBridgeConsumesTouchSurface(): Boolean =
+        touchscreenReaderRunning && touchscreenReaderReady && rawTouchscreenBridgeEligible()
+
+    private fun startRawTouchscreenReaderIfEligible() {
+        if (!rawTouchscreenBridgeEligible() || touchscreenReaderRunning) return
+        val binder = rikka.shizuku.Shizuku.getBinder()
+        if (binder == null) {
+            fallbackFromRawTouchscreen("shizuku_binder_unavailable")
+            return
+        }
+        val generation = touchscreenReaderGeneration + 1
+        touchscreenReaderGeneration = generation
+        val command = "while true; do " +
+            "dev=\$(getevent -pl 2>/dev/null | awk '" +
+            "/^add device/{d=\$NF} /name:.*\"sec_touchscreen\"/{print d; exit}'); " +
+            "if [ -n \"\$dev\" ]; then " +
+            "echo DEXTOP_TOUCH_DEVICE=\$dev; getevent -lt \"\$dev\"; " +
+            "echo DEXTOP_TOUCH_EOF=\$dev; " +
+            "else echo DEXTOP_TOUCH_WAITING; fi; sleep 1; done"
+        runCatching {
+            val remote = IShizukuService.Stub.asInterface(binder)
+                .newProcess(arrayOf("sh", "-c", command), null, null)
+            touchscreenReaderProcess = remote
+            touchscreenReaderRunning = true
+            touchscreenReaderReady = false
+            touchscreenReaderDevice = ""
+            rawTouchscreenSuppressUntilAllUp = false
+            rawTouchscreenThreeFingerCaptured = false
+            rawTouchscreenLastPhysicalContactCount = 0
+            rawTouchscreenLastMappedContactCount = 0
+            rawTouchscreenSourceFrameCount = 0L
+            rawTouchscreenForwardedFrameCount = 0L
+            rawTouchscreenLastDiagnosticAt = 0L
+            drainLaptopKeyboardPipe(remote.errorStream, "touchscreen_stderr")
+            Thread {
+                runRawTouchscreenReader(remote, generation)
+            }.apply {
+                name = "DextopTouchscreenReader"
+                isDaemon = true
+            }.start()
+            root?.postDelayed({
+                if (generation == touchscreenReaderGeneration &&
+                    touchscreenReaderRunning && !touchscreenReaderReady) {
+                    fallbackFromRawTouchscreen("device_discovery_timeout")
+                }
+            }, 4_000L)
+            val message = "raw touchscreen reader started generation=$generation " +
+                "model=${Build.MODEL} device=${Build.DEVICE} expectedName=sec_touchscreen"
+            OperationLog.i(this, "InputRouting", message)
+            Log.i(logTag, message)
+        }.onFailure { error ->
+            OperationLog.w(this, "InputRouting", "raw touchscreen reader start failed", error)
+            Log.e(logTag, "raw touchscreen reader start failed", error)
+            fallbackFromRawTouchscreen("reader_start_failed")
+        }
+    }
+
+    private fun runRawTouchscreenReader(
+        remote: moe.shizuku.server.IRemoteProcess,
+        generation: Long
+    ) {
+        val trackingIds = IntArray(RAW_TOUCHSCREEN_MAX_SLOTS) { -1 }
+        val positionsX = IntArray(RAW_TOUCHSCREEN_MAX_SLOTS)
+        val positionsY = IntArray(RAW_TOUCHSCREEN_MAX_SLOTS)
+        val touchMajors = IntArray(RAW_TOUCHSCREEN_MAX_SLOTS)
+        var currentSlot = 0
+        var failure: Throwable? = null
+
+        fun clearPhysicalSlots() {
+            trackingIds.fill(-1)
+            positionsX.fill(0)
+            positionsY.fill(0)
+            touchMajors.fill(0)
+            currentSlot = 0
+        }
+
+        try {
+            BufferedReader(
+                InputStreamReader(
+                    android.os.ParcelFileDescriptor.AutoCloseInputStream(remote.inputStream)
+                )
+            ).useLines { lines ->
+                lines.takeWhile {
+                    touchscreenReaderRunning && generation == touchscreenReaderGeneration
+                }.forEach { line ->
+                    when {
+                        line.startsWith("DEXTOP_TOUCH_DEVICE=") -> {
+                            clearPhysicalSlots()
+                            val device = line.substringAfter('=').trim()
+                            root?.post { onRawTouchscreenDeviceReady(generation, device) }
+                            return@forEach
+                        }
+                        line.startsWith("DEXTOP_TOUCH_EOF=") -> {
+                            clearPhysicalSlots()
+                            val device = line.substringAfter('=').trim()
+                            root?.post {
+                                onRawTouchscreenSourceReset(generation, "device_eof:$device")
+                            }
+                            return@forEach
+                        }
+                        line == "DEXTOP_TOUCH_WAITING" -> return@forEach
+                    }
+                    val fields = line.trim().split(Regex("\\s+"))
+                    if (fields.size < 3) return@forEach
+                    val type = fields[fields.size - 3]
+                    val code = fields[fields.size - 2]
+                    val value = fields.last().toLongOrNull(16)?.toInt() ?: return@forEach
+                    when {
+                        (type == "EV_ABS" || type == "0003") &&
+                            (code == "ABS_MT_SLOT" || code == "002f") -> {
+                            currentSlot = value.coerceIn(0, RAW_TOUCHSCREEN_MAX_SLOTS - 1)
+                        }
+                        (type == "EV_ABS" || type == "0003") &&
+                            (code == "ABS_MT_TRACKING_ID" || code == "0039") -> {
+                            trackingIds[currentSlot] = value
+                            if (value < 0) {
+                                touchMajors[currentSlot] = 0
+                            }
+                        }
+                        (type == "EV_ABS" || type == "0003") &&
+                            (code == "ABS_MT_POSITION_X" || code == "0035") -> {
+                            positionsX[currentSlot] = value
+                        }
+                        (type == "EV_ABS" || type == "0003") &&
+                            (code == "ABS_MT_POSITION_Y" || code == "0036") -> {
+                            positionsY[currentSlot] = value
+                        }
+                        (type == "EV_ABS" || type == "0003") &&
+                            (code == "ABS_MT_TOUCH_MAJOR" || code == "0030") -> {
+                            touchMajors[currentSlot] = value
+                        }
+                        (type == "EV_SYN" || type == "0000") &&
+                            (code == "SYN_REPORT" || code == "0000") -> {
+                            val contacts = trackingIds.indices.mapNotNull { slot ->
+                                val trackingId = trackingIds[slot]
+                                if (trackingId < 0) null else RawTouchscreenContact(
+                                    physicalSlot = slot,
+                                    trackingId = trackingId,
+                                    rawX = positionsX[slot],
+                                    rawY = positionsY[slot],
+                                    touchMajor = touchMajors[slot]
+                                )
+                            }
+                            root?.post {
+                                handleRawTouchscreenFrame(generation, contacts)
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (error: Throwable) {
+            failure = error
+        } finally {
+            root?.post { onRawTouchscreenReaderExited(generation, failure) }
+        }
+    }
+
+    private fun onRawTouchscreenDeviceReady(generation: Long, device: String) {
+        if (generation != touchscreenReaderGeneration || !touchscreenReaderRunning) return
+        touchscreenReaderDevice = device
+        touchscreenReaderReady = true
+        if (virtualTouchpadActiveContactCount() > 0) {
+            finishVirtualTouchpadGesture("raw_touchscreen_activated", allowDirectTouch = true)
+        }
+        val inputSurface = if (laptopModeActive) laptopTrackpadView else surfaceView
+        val surfaceName = if (laptopModeActive) "laptop_trackpad" else "fullscreen_surface"
+        val message = "raw touchscreen ready generation=$generation path=$device " +
+            "surface=$surfaceName size=${inputSurface?.width ?: 0}x${inputSurface?.height ?: 0} " +
+            "root=${root?.width ?: 0}x${root?.height ?: 0}"
+        OperationLog.i(this, "InputRouting", message)
+        Log.i(logTag, message)
+    }
+
+    private fun onRawTouchscreenSourceReset(generation: Long, reason: String) {
+        if (generation != touchscreenReaderGeneration || !touchscreenReaderRunning) return
+        touchscreenReaderReady = false
+        if (virtualTouchpadActiveContactCount() > 0) {
+            finishVirtualTouchpadGesture("raw_source_reset", allowDirectTouch = true)
+        }
+        resetRawTouchscreenGestureState()
+        val message = "raw touchscreen source reset generation=$generation reason=$reason"
+        OperationLog.w(this, "InputRouting", message)
+        Log.w(logTag, message)
+    }
+
+    private fun onRawTouchscreenReaderExited(generation: Long, failure: Throwable?) {
+        if (generation != touchscreenReaderGeneration || !touchscreenReaderRunning) return
+        touchscreenReaderRunning = false
+        touchscreenReaderReady = false
+        touchscreenReaderProcess = null
+        val message = "raw touchscreen reader exited generation=$generation " +
+            "path=$touchscreenReaderDevice frames=$rawTouchscreenSourceFrameCount " +
+            "forwarded=$rawTouchscreenForwardedFrameCount failure=${failure?.javaClass?.simpleName ?: "none"}"
+        OperationLog.w(this, "InputRouting", message, failure)
+        Log.w(logTag, message, failure)
+        resetRawTouchscreenGestureState()
+        fallbackFromRawTouchscreen("reader_exited")
+    }
+
+    private fun rawTouchscreenViewBounds(view: View?): Rect? {
+        val target = view ?: return null
+        if (!target.isAttachedToWindow || target.width <= 0 || target.height <= 0) return null
+        val location = IntArray(2)
+        target.getLocationOnScreen(location)
+        return Rect(location[0], location[1], location[0] + target.width, location[1] + target.height)
+    }
+
+    private fun mapRawTouchscreenContacts(
+        contacts: List<RawTouchscreenContact>
+    ): List<MappedRawTouchscreenContact> {
+        val frame = root ?: return emptyList()
+        val inputSurface = if (laptopModeActive) laptopTrackpadView else surfaceView
+        val inputBounds = rawTouchscreenViewBounds(inputSurface) ?: return emptyList()
+        val rootBounds = rawTouchscreenViewBounds(frame) ?: return emptyList()
+        val fnBounds = if (laptopModeActive) rawTouchscreenViewBounds(laptopFnButton) else null
+        val menuBounds = if (laptopModeActive) rawTouchscreenViewBounds(laptopMenuButton) else null
+        return contacts.mapNotNull { contact ->
+            val screenX = rootBounds.left +
+                (contact.rawX.coerceIn(0, FOLD8_RAW_TOUCHSCREEN_MAX_X).toFloat() /
+                    FOLD8_RAW_TOUCHSCREEN_MAX_X * rootBounds.width()).roundToInt()
+            val screenY = rootBounds.top +
+                (contact.rawY.coerceIn(0, FOLD8_RAW_TOUCHSCREEN_MAX_Y).toFloat() /
+                    FOLD8_RAW_TOUCHSCREEN_MAX_Y * rootBounds.height()).roundToInt()
+            if (!inputBounds.contains(screenX, screenY) ||
+                fnBounds?.contains(screenX, screenY) == true ||
+                menuBounds?.contains(screenX, screenY) == true) {
+                return@mapNotNull null
+            }
+            val x = ((screenX - inputBounds.left).toFloat() /
+                inputBounds.width().coerceAtLeast(1) * VIRTUAL_TOUCHPAD_MAX_X)
+                .roundToInt().coerceIn(0, VIRTUAL_TOUCHPAD_MAX_X)
+            val y = ((screenY - inputBounds.top).toFloat() /
+                inputBounds.height().coerceAtLeast(1) * VIRTUAL_TOUCHPAD_MAX_Y)
+                .roundToInt().coerceIn(0, VIRTUAL_TOUCHPAD_MAX_Y)
+            MappedRawTouchscreenContact(
+                trackingId = contact.trackingId,
+                x = x,
+                y = y,
+                touchMajor = contact.touchMajor.coerceIn(1, 255)
+            )
+        }
+    }
+
+    private fun handleRawTouchscreenFrame(
+        generation: Long,
+        physicalContacts: List<RawTouchscreenContact>
+    ) {
+        if (generation != touchscreenReaderGeneration ||
+            !rawTouchscreenBridgeConsumesTouchSurface()) return
+        rawTouchscreenSourceFrameCount += 1
+        val previousPhysicalCount = rawTouchscreenLastPhysicalContactCount
+        val previousMappedCount = rawTouchscreenLastMappedContactCount
+        rawTouchscreenLastPhysicalContactCount = physicalContacts.size
+        val mappedContacts = mapRawTouchscreenContacts(physicalContacts)
+        rawTouchscreenLastMappedContactCount = mappedContacts.size
+
+        if (menu?.visibility == View.VISIBLE) {
+            if (virtualTouchpadActiveContactCount() > 0) {
+                finishVirtualTouchpadGesture("raw_menu_visible", allowDirectTouch = true)
+            }
+            rawTouchscreenSuppressUntilAllUp = physicalContacts.isNotEmpty()
+            logRawTouchscreenFrame(
+                previousPhysicalCount,
+                previousMappedCount,
+                physicalContacts,
+                mappedContacts,
+                "menu_visible"
+            )
+            return
+        }
+
+        if (rawTouchscreenSuppressUntilAllUp) {
+            if (physicalContacts.isEmpty()) {
+                rawTouchscreenSuppressUntilAllUp = false
+                OperationLog.i(this, "InputRouting", "raw touchscreen rearmed after menu contacts released")
+                Log.i(logTag, "raw touchscreen rearmed after menu contacts released")
+            }
+            logRawTouchscreenFrame(
+                previousPhysicalCount,
+                previousMappedCount,
+                physicalContacts,
+                mappedContacts,
+                "waiting_all_up"
+            )
+            return
+        }
+
+        if (rawTouchscreenThreeFingerCaptured) {
+            rawTouchscreenThreeFingerPeakContacts = maxOf(
+                rawTouchscreenThreeFingerPeakContacts,
+                mappedContacts.size
+            )
+            if (physicalContacts.isEmpty()) {
+                val duration = (SystemClock.uptimeMillis() - rawTouchscreenThreeFingerStartedAt)
+                    .coerceAtLeast(0L)
+                val peak = rawTouchscreenThreeFingerPeakContacts
+                rawTouchscreenThreeFingerCaptured = false
+                rawTouchscreenThreeFingerStartedAt = 0L
+                rawTouchscreenThreeFingerPeakContacts = 0
+                val message = "raw three-finger gesture completed durationMs=$duration peakContacts=$peak " +
+                    "configuredAction=${getSharedPreferences("FlutterSharedPreferences", MODE_PRIVATE).getString("flutter.gesture_three_finger", "menu")}"
+                OperationLog.i(this, "InputRouting", message)
+                Log.i(logTag, message)
+                performConfiguredGesture()
+            }
+            logRawTouchscreenFrame(
+                previousPhysicalCount,
+                previousMappedCount,
+                physicalContacts,
+                mappedContacts,
+                "three_finger_captured"
+            )
+            return
+        }
+
+        if (mappedContacts.size >= 3) {
+            rawTouchscreenThreeFingerCaptured = true
+            rawTouchscreenThreeFingerStartedAt = SystemClock.uptimeMillis()
+            rawTouchscreenThreeFingerPeakContacts = mappedContacts.size
+            finishVirtualTouchpadGesture("raw_three_finger_intercept", allowDirectTouch = true)
+            performLaptopHaptic(laptopTrackpadView, strong = true)
+            val contacts = mappedContacts.joinToString(prefix = "[", postfix = "]") {
+                "id=${it.trackingId},x=${it.x},y=${it.y}"
+            }
+            val message = "raw three-finger gesture captured contacts=$contacts; " +
+                "virtual contacts released and source suppressed until all physical fingers are up"
+            OperationLog.i(this, "InputRouting", message)
+            Log.i(logTag, message)
+            return
+        }
+
+        forwardRawTouchscreenContacts(mappedContacts)
+        logRawTouchscreenFrame(
+            previousPhysicalCount,
+            previousMappedCount,
+            physicalContacts,
+            mappedContacts,
+            "forwarding"
+        )
+    }
+
+    private fun forwardRawTouchscreenContacts(
+        contacts: List<MappedRawTouchscreenContact>
+    ) {
+        val previousCount = virtualTouchpadActiveContactCount()
+        if (contacts.isEmpty()) {
+            if (previousCount > 0) {
+                finishVirtualTouchpadGesture("raw_all_contacts_up", allowDirectTouch = true)
+            }
+            return
+        }
+        if (previousCount == 0) {
+            virtualTouchpadGestureSequence += 1
+            virtualTouchpadGestureStartedAt = SystemClock.uptimeMillis()
+            virtualTouchpadFrameCount = 0
+            virtualTouchpadContactUpdateCount = 0
+        }
+        val activeTrackingIds = contacts.mapTo(mutableSetOf()) { it.trackingId }
+        val events = mutableListOf<Any>()
+        virtualTouchpadSlotPointerIds.indices.forEach { slot ->
+            val pointerId = virtualTouchpadSlotPointerIds[slot]
+            if (pointerId >= 0 && pointerId !in activeTrackingIds) {
+                events += "EV_ABS"; events += "ABS_MT_SLOT"; events += slot
+                events += "EV_ABS"; events += "ABS_MT_TRACKING_ID"; events += -1
+                virtualTouchpadSlotPointerIds[slot] = -1
+                virtualTouchpadSlotTrackingIds[slot] = -1
+            }
+        }
+        contacts.forEach { contact ->
+            val existingSlot = virtualTouchpadSlotPointerIds.indexOf(contact.trackingId)
+            val slot = allocateVirtualTouchpadSlot(contact.trackingId) ?: return@forEach
+            events += "EV_ABS"; events += "ABS_MT_SLOT"; events += slot
+            if (existingSlot < 0) {
+                events += "EV_ABS"; events += "ABS_MT_TRACKING_ID"
+                events += virtualTouchpadSlotTrackingIds[slot]
+            }
+            events += "EV_ABS"; events += "ABS_MT_POSITION_X"; events += contact.x
+            events += "EV_ABS"; events += "ABS_MT_POSITION_Y"; events += contact.y
+            events += "EV_ABS"; events += "ABS_MT_TOUCH_MAJOR"; events += contact.touchMajor
+            events += "EV_ABS"; events += "ABS_MT_PRESSURE"; events += VIRTUAL_TOUCHPAD_PRESSURE
+            virtualTouchpadContactUpdateCount += 1
+        }
+        if (previousCount == 0) {
+            events += "EV_KEY"; events += "BTN_TOUCH"; events += 1
+        }
+        events += "EV_SYN"; events += "SYN_REPORT"; events += 0
+        if (!virtualTouchpadEvents(events, allowDirectTouch = true)) {
+            OperationLog.w(
+                this,
+                "InputRouting",
+                "raw touchscreen frame send failed contacts=${contacts.size} sequence=$virtualTouchpadGestureSequence"
+            )
+            Log.w(logTag, "raw touchscreen frame send failed contacts=${contacts.size}")
+            resetVirtualTouchpadState("raw_frame_send_failed", logSummary = true)
+            return
+        }
+        virtualTouchpadFrameCount += 1
+        rawTouchscreenForwardedFrameCount += 1
+    }
+
+    private fun logRawTouchscreenFrame(
+        previousPhysicalCount: Int,
+        previousMappedCount: Int,
+        physicalContacts: List<RawTouchscreenContact>,
+        mappedContacts: List<MappedRawTouchscreenContact>,
+        state: String
+    ) {
+        val now = SystemClock.uptimeMillis()
+        val contactCountChanged = previousPhysicalCount != physicalContacts.size ||
+            previousMappedCount != mappedContacts.size
+        if (!contactCountChanged &&
+            now - rawTouchscreenLastDiagnosticAt < RAW_TOUCHSCREEN_DIAGNOSTIC_INTERVAL_MS) return
+        rawTouchscreenLastDiagnosticAt = now
+        val surfaceName = if (laptopModeActive) "laptop_trackpad" else "fullscreen_surface"
+        val inputBounds = rawTouchscreenViewBounds(
+            if (laptopModeActive) laptopTrackpadView else surfaceView
+        )
+        val physicalSummary = physicalContacts.joinToString(prefix = "[", postfix = "]") {
+            "slot=${it.physicalSlot},id=${it.trackingId},raw=${it.rawX}:${it.rawY}"
+        }
+        val mappedSummary = mappedContacts.joinToString(prefix = "[", postfix = "]") {
+            "id=${it.trackingId},xy=${it.x}:${it.y}"
+        }
+        val message = "raw touchscreen frame state=$state path=$touchscreenReaderDevice " +
+            "sourceFrames=$rawTouchscreenSourceFrameCount forwardedFrames=$rawTouchscreenForwardedFrameCount " +
+            "physical=${physicalContacts.size} mapped=${mappedContacts.size} " +
+            "virtual=${virtualTouchpadActiveContactCount()} captured=$rawTouchscreenThreeFingerCaptured " +
+            "suppressed=$rawTouchscreenSuppressUntilAllUp surface=$surfaceName bounds=$inputBounds " +
+            "rawContacts=$physicalSummary mappedContacts=$mappedSummary"
+        Log.d(logTag, message)
+        if (contactCountChanged) OperationLog.i(this, "InputRouting", message)
+    }
+
+    private fun resetRawTouchscreenGestureState() {
+        rawTouchscreenSuppressUntilAllUp = false
+        rawTouchscreenThreeFingerCaptured = false
+        rawTouchscreenThreeFingerStartedAt = 0L
+        rawTouchscreenThreeFingerPeakContacts = 0
+        rawTouchscreenLastPhysicalContactCount = 0
+        rawTouchscreenLastMappedContactCount = 0
+    }
+
+    private fun stopRawTouchscreenReader(reason: String) {
+        val wasRunning = touchscreenReaderRunning || touchscreenReaderProcess != null
+        val path = touchscreenReaderDevice
+        val sourceFrames = rawTouchscreenSourceFrameCount
+        val forwardedFrames = rawTouchscreenForwardedFrameCount
+        touchscreenReaderGeneration += 1
+        touchscreenReaderRunning = false
+        touchscreenReaderReady = false
+        touchscreenReaderProcess?.let { runCatching { it.destroy() } }
+        touchscreenReaderProcess = null
+        if (virtualTouchpadActiveContactCount() > 0) {
+            finishVirtualTouchpadGesture("raw_reader_stopped", allowDirectTouch = true)
+        }
+        resetRawTouchscreenGestureState()
+        touchscreenReaderDevice = ""
+        if (wasRunning) {
+            val message = "raw touchscreen reader stopped reason=$reason path=$path " +
+                "sourceFrames=$sourceFrames forwardedFrames=$forwardedFrames"
+            OperationLog.i(this, "InputRouting", message)
+            Log.i(logTag, message)
+        }
+    }
+
+    private fun fallbackFromRawTouchscreen(reason: String) {
+        if (!active || (!laptopModeActive && directTouch) ||
+            laptopFoldProfile() != LaptopFoldProfile.FOLD8 ||
+            activeVirtualPointerProfile() != "touchpad") return
+        val message = "raw touchscreen unavailable reason=$reason; " +
+            "using session-only software cursor fallback so menu and exit remain reachable"
+        OperationLog.w(this, "InputRouting", message)
+        Log.w(logTag, message)
+        stopRawTouchscreenReader("fallback:$reason")
+        virtualPointerRuntimeProfile = "software"
+        stopVirtualMouse()
+        updateVirtualCursorVisibility()
     }
 
     private fun startRawMouseReader() {
