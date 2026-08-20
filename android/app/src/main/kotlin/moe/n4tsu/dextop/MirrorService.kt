@@ -7784,6 +7784,12 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
             .invoke(device) as Int
     }.getOrDefault(Display.INVALID_DISPLAY)
 
+    /** InputEvent#getDisplayId is not exposed by every compile SDK in use. */
+    private fun motionEventDisplayId(event: MotionEvent): Int = runCatching {
+        InputEvent::class.java.getMethod("getDisplayId")
+            .invoke(event) as Int
+    }.getOrDefault(Display.INVALID_DISPLAY)
+
     private fun rawTouchscreenBindingForEvent(
         event: MotionEvent,
         sourceView: View
@@ -7793,7 +7799,7 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         val descriptor = device.descriptor.orEmpty().trim()
         if (descriptor.isBlank()) return null
         val associatedDisplay = associatedDisplayId(device)
-        val eventDisplay = event.displayId
+        val eventDisplay = motionEventDisplayId(event)
         val displayId = when {
             associatedDisplay != Display.INVALID_DISPLAY -> associatedDisplay
             eventDisplay != Display.INVALID_DISPLAY -> eventDisplay
@@ -7834,7 +7840,7 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         val binding = rawTouchscreenBindingForEvent(event, sourceView)
         if (binding == null) {
             val message = "raw touchscreen source unavailable actionDeviceId=${event.deviceId} " +
-                "eventDisplayId=${event.displayId}; retaining MotionEvent routing"
+                "eventDisplayId=${motionEventDisplayId(event)}; retaining MotionEvent routing"
             OperationLog.w(this, "InputRouting", message)
             Log.w(logTag, message)
             return
