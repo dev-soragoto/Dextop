@@ -774,14 +774,14 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
     @Volatile private var touchscreenReaderReady = false
     private var touchscreenReaderGeneration = 0L
     private var touchscreenReaderDevice = ""
-    private var touchscreenReaderRequestedBinding: RawTouchscreenBinding? = null
-    private var touchscreenReaderActiveBinding: RawTouchscreenBinding? = null
+    private var touchscreenReaderActiveDevice: RawTouchscreenDevice? = null
+    private var touchscreenReaderCandidateCount = 0
+    private var rawTouchscreenTopologyRefreshGeneration = 0L
+    private var rawTouchscreenDeliveryProbeGeneration = 0L
     private var rawTouchscreenMinX = 0
     private var rawTouchscreenMaxX = 1
     private var rawTouchscreenMinY = 0
     private var rawTouchscreenMaxY = 1
-    /** Never switch producers in the middle of the MotionEvent used to discover a panel. */
-    private var rawTouchscreenOverlayPrimingGesture = false
     private var rawTouchscreenSuppressUntilAllUp = false
     private var rawTouchscreenThreeFingerCaptured = false
     private var rawTouchscreenThreeFingerStartedAt = 0L
@@ -1039,15 +1039,15 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
     private val inputDeviceListener = object : InputManager.InputDeviceListener {
         override fun onInputDeviceAdded(deviceId: Int) {
             refreshPhysicalInputState()
-            onRawTouchscreenInputDeviceTopologyChanged(deviceId, "added")
+            scheduleRawTouchscreenTopologyRefresh("input_device_added_$deviceId")
         }
         override fun onInputDeviceRemoved(deviceId: Int) {
             refreshPhysicalInputState()
-            onRawTouchscreenInputDeviceTopologyChanged(deviceId, "removed")
+            scheduleRawTouchscreenTopologyRefresh("input_device_removed_$deviceId")
         }
         override fun onInputDeviceChanged(deviceId: Int) {
             refreshPhysicalInputState()
-            onRawTouchscreenInputDeviceTopologyChanged(deviceId, "changed")
+            scheduleRawTouchscreenTopologyRefresh("input_device_changed_$deviceId")
         }
     }
     private val displayListener = object : DisplayManager.DisplayListener {
@@ -1083,7 +1083,7 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
             scheduleInternal120HzReapply(requireExternalDisplay = true)
             scheduleLaptopModeReevaluation("display_changed")
             if (active && displayId == Display.DEFAULT_DISPLAY) {
-                invalidateRawTouchscreenBinding("default_display_changed")
+                scheduleRawTouchscreenTopologyRefresh("default_display_changed")
                 leaveLaptopModeOnCoverDisplay()
                 scheduleHostDisplayReconfiguration("default display changed")
             } else if (active && displayId == targetDisplayId && mirrorDisplayId >= 0) {
@@ -1712,15 +1712,46 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         val touchMajor: Int
     )
 
-    /** Framework identity for the physical panel that produced an overlay touch. */
-    private data class RawTouchscreenBinding(
-        val androidDeviceId: Int,
+    /** Physical direct-touch device discovered entirely through Shizuku. */
+    private data class RawTouchscreenDevice(
+        val path: String,
         val name: String,
         val descriptor: String,
-        val displayId: Int
+        val minX: Int,
+        val maxX: Int,
+        val minY: Int,
+        val maxY: Int
     ) {
         fun summary(): String =
-            "deviceId=$androidDeviceId name=$name descriptor=$descriptor displayId=$displayId"
+            "path=$path name=$name descriptor=$descriptor " +
+                "range=[$minX..$maxX,$minY..$maxY]"
+    }
+
+    private class RawTouchscreenParserState(val device: RawTouchscreenDevice) {
+        val trackingIds = IntArray(RAW_TOUCHSCREEN_MAX_SLOTS) { -1 }
+        val positionsX = IntArray(RAW_TOUCHSCREEN_MAX_SLOTS)
+        val positionsY = IntArray(RAW_TOUCHSCREEN_MAX_SLOTS)
+        val touchMajors = IntArray(RAW_TOUCHSCREEN_MAX_SLOTS)
+        var currentSlot = 0
+
+        fun clear() {
+            trackingIds.fill(-1)
+            positionsX.fill(0)
+            positionsY.fill(0)
+            touchMajors.fill(0)
+            currentSlot = 0
+        }
+
+        fun contacts(): List<RawTouchscreenContact> = trackingIds.indices.mapNotNull { slot ->
+            val trackingId = trackingIds[slot]
+            if (trackingId < 0) null else RawTouchscreenContact(
+                physicalSlot = slot,
+                trackingId = trackingId,
+                rawX = positionsX[slot],
+                rawY = positionsY[slot],
+                touchMajor = touchMajors[slot]
+            )
+        }
     }
 
     private enum class RawTouchscreenTarget(val logName: String) {
@@ -5571,9 +5602,6 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         maxPointers = maxOf(maxPointers, event.pointerCount)
         val rawBridgeOwnsSource = sourceView === surfaceView ||
             sourceView === laptopTrackpadView
-        if (!rawBridgeFrame && rawBridgeOwnsSource && !useDirectTouch) {
-            observeRawTouchscreenSource(event, sourceView)
-        }
         if (!rawBridgeFrame && rawBridgeOwnsSource &&
             rawTouchscreenBridgeConsumesTouchSurface(sourceView)) {
             // InputDispatcher may cancel this accessibility-window stream as
@@ -5582,6 +5610,9 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
             // for this gesture and the overlay must never duplicate frames.
             if (event.actionMasked == MotionEvent.ACTION_DOWN ||
                 event.actionMasked == MotionEvent.ACTION_CANCEL) {
+                if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+                    scheduleRawTouchscreenDeliveryWatchdog()
+                }
                 Log.i(
                     logTag,
                     "overlay touch ignored by raw bridge action=${MotionEvent.actionToString(event.action)} " +
@@ -7742,7 +7773,8 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
      * Direct touch deliberately remains on Android MotionEvent so framework
      * transforms, accessibility semantics, and application touch behavior are
      * unchanged. The raw reader is bound from the MotionEvent's exact
-     * InputDevice descriptor; no model or vendor device name is assumed.
+     * EventHub capabilities; no MotionEvent device identity, model, or vendor
+     * device name is assumed.
      */
     private fun rawTouchscreenBridgeEligible(): Boolean {
         val profile = activeVirtualPointerProfile()
@@ -7754,8 +7786,7 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
 
     private fun rawTouchscreenBridgeConsumesTouchSurface(sourceView: View? = null): Boolean {
         if (!touchscreenReaderRunning || !touchscreenReaderReady ||
-            rawTouchscreenOverlayPrimingGesture ||
-            touchscreenReaderActiveBinding == null ||
+            touchscreenReaderCandidateCount <= 0 ||
             !rawTouchscreenBridgeEligible()) return false
         return when {
             sourceView == null -> true
@@ -7765,129 +7796,42 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         }
     }
 
-    private fun rawTouchscreenBindingsMatch(
-        first: RawTouchscreenBinding?,
-        second: RawTouchscreenBinding?
-    ): Boolean {
-        if (first == null || second == null) return false
-        val sameIdentity = first.descriptor.isNotBlank() &&
-            first.descriptor == second.descriptor
-        val sameDisplay = first.displayId == Display.INVALID_DISPLAY ||
-            second.displayId == Display.INVALID_DISPLAY ||
-            first.displayId == second.displayId
-        return sameIdentity && sameDisplay
-    }
-
-    /** API 37 method accessed reflectively so the project remains minSdk-safe. */
-    private fun associatedDisplayId(device: InputDevice): Int = runCatching {
-        InputDevice::class.java.getMethod("getAssociatedDisplayId")
-            .invoke(device) as Int
-    }.getOrDefault(Display.INVALID_DISPLAY)
-
-    /** InputEvent#getDisplayId is not exposed by every compile SDK in use. */
-    private fun motionEventDisplayId(event: MotionEvent): Int = runCatching {
-        InputEvent::class.java.getMethod("getDisplayId")
-            .invoke(event) as Int
-    }.getOrDefault(Display.INVALID_DISPLAY)
-
-    private fun rawTouchscreenBindingForEvent(
-        event: MotionEvent,
-        sourceView: View
-    ): RawTouchscreenBinding? {
-        val device = InputDevice.getDevice(event.deviceId) ?: return null
-        if (device.isVirtual || !device.supportsSource(InputDevice.SOURCE_TOUCHSCREEN)) return null
-        val descriptor = device.descriptor.orEmpty().trim()
-        if (descriptor.isBlank()) return null
-        val associatedDisplay = associatedDisplayId(device)
-        val eventDisplay = motionEventDisplayId(event)
-        val displayId = when {
-            associatedDisplay != Display.INVALID_DISPLAY -> associatedDisplay
-            eventDisplay != Display.INVALID_DISPLAY -> eventDisplay
-            sourceView.display != null -> sourceView.display.displayId
-            else -> Display.INVALID_DISPLAY
-        }
-        return RawTouchscreenBinding(
-            androidDeviceId = device.id,
-            name = device.name.orEmpty(),
-            descriptor = descriptor,
-            displayId = displayId
-        )
-    }
-
-    /**
-     * Learns the current panel from a real overlay event. A new panel never
-     * inherits the previous reader: the discovery gesture stays on MotionEvent
-     * and raw takeover starts only after every finger from that gesture is up.
-     */
-    private fun observeRawTouchscreenSource(event: MotionEvent, sourceView: View) {
-        if (!rawTouchscreenBridgeEligible()) return
-        if (event.actionMasked == MotionEvent.ACTION_UP) {
-            if (rawTouchscreenOverlayPrimingGesture) {
-                rawTouchscreenOverlayPrimingGesture = false
-                resetRawTouchscreenGestureState()
-                OperationLog.i(
-                    this,
-                    "InputRouting",
-                    "raw touchscreen discovery gesture finished; raw takeover armed"
-                )
+    private fun scheduleRawTouchscreenTopologyRefresh(reason: String) {
+        val refreshGeneration = ++rawTouchscreenTopologyRefreshGeneration
+        root?.postDelayed({
+            if (refreshGeneration != rawTouchscreenTopologyRefreshGeneration || !active) {
+                return@postDelayed
             }
-            return
-        }
-        if (event.actionMasked != MotionEvent.ACTION_DOWN) return
-        // ACTION_DOWN proves that a previous canceled/priming physical stream
-        // is no longer active, even if its final ACTION_UP was not dispatched.
-        rawTouchscreenOverlayPrimingGesture = false
-        val binding = rawTouchscreenBindingForEvent(event, sourceView)
-        if (binding == null) {
-            val message = "raw touchscreen source unavailable actionDeviceId=${event.deviceId} " +
-                "eventDisplayId=${motionEventDisplayId(event)}; retaining MotionEvent routing"
+            val wasRunning = touchscreenReaderRunning
+            if (wasRunning) stopRawTouchscreenReader("topology_refresh:$reason")
+            if (rawTouchscreenBridgeEligible()) startRawTouchscreenReaderIfEligible()
+            val message = "raw touchscreen topology refresh reason=$reason " +
+                "wasRunning=$wasRunning eligible=${rawTouchscreenBridgeEligible()}"
+            OperationLog.i(this, "InputRouting", message)
+            Log.i(logTag, message)
+        }, 220L)
+    }
+
+    private fun scheduleRawTouchscreenDeliveryWatchdog() {
+        val probeGeneration = ++rawTouchscreenDeliveryProbeGeneration
+        val readerGeneration = touchscreenReaderGeneration
+        val initialFrames = rawTouchscreenSourceFrameCount
+        root?.postDelayed({
+            if (probeGeneration != rawTouchscreenDeliveryProbeGeneration ||
+                readerGeneration != touchscreenReaderGeneration ||
+                !touchscreenReaderRunning || !touchscreenReaderReady) return@postDelayed
+            if (rawTouchscreenSourceFrameCount != initialFrames) return@postDelayed
+            val message = "raw touchscreen delivery watchdog timed out " +
+                "generation=$readerGeneration candidates=$touchscreenReaderCandidateCount; " +
+                "restoring MotionEvent fallback"
             OperationLog.w(this, "InputRouting", message)
             Log.w(logTag, message)
-            return
-        }
-        val requestedMatches = rawTouchscreenBindingsMatch(
-            touchscreenReaderRequestedBinding,
-            binding
-        )
-        if (requestedMatches && touchscreenReaderRunning) return
-
-        val previous = touchscreenReaderRequestedBinding
-        stopRawTouchscreenReader("physical_source_rebind")
-        touchscreenReaderRequestedBinding = binding
-        rawTouchscreenOverlayPrimingGesture = true
-        val message = "raw touchscreen source selected ${binding.summary()} " +
-            "previous=${previous?.summary() ?: "none"}; discovery gesture uses MotionEvent"
-        OperationLog.i(this, "InputRouting", message)
-        Log.i(logTag, message)
-        startRawTouchscreenReaderIfEligible()
+            fallbackFromRawTouchscreen("overlay_down_without_raw_source")
+        }, 350L)
     }
-
-    private fun onRawTouchscreenInputDeviceTopologyChanged(deviceId: Int, change: String) {
-        val requested = touchscreenReaderRequestedBinding
-        val bound = touchscreenReaderActiveBinding
-        if (requested?.androidDeviceId != deviceId && bound?.androidDeviceId != deviceId) return
-        invalidateRawTouchscreenBinding("input_device_${change}_$deviceId")
-    }
-
-    private fun invalidateRawTouchscreenBinding(reason: String) {
-        val previous = touchscreenReaderActiveBinding ?: touchscreenReaderRequestedBinding
-        if (previous == null && !touchscreenReaderRunning) return
-        stopRawTouchscreenReader("binding_invalidated:$reason")
-        touchscreenReaderRequestedBinding = null
-        touchscreenReaderActiveBinding = null
-        rawTouchscreenOverlayPrimingGesture = false
-        val message = "raw touchscreen binding invalidated reason=$reason " +
-            "previous=${previous?.summary() ?: "none"}; awaiting next MotionEvent source"
-        OperationLog.i(this, "InputRouting", message)
-        Log.i(logTag, message)
-    }
-
-    private fun shellSingleQuote(value: String): String =
-        "'" + value.replace("'", "'\"'\"'") + "'"
 
     private fun startRawTouchscreenReaderIfEligible() {
         if (!rawTouchscreenBridgeEligible() || touchscreenReaderRunning) return
-        val binding = touchscreenReaderRequestedBinding ?: return
         val binder = rikka.shizuku.Shizuku.getBinder()
         if (binder == null) {
             fallbackFromRawTouchscreen("shizuku_binder_unavailable")
@@ -7897,26 +7841,41 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         touchscreenReaderGeneration = generation
         val dollar = '$'
         val command = """
-            target=${shellSingleQuote(binding.descriptor)}
+            candidate_file=${dollar}(mktemp /data/local/tmp/dextop-touch.XXXXXX) || exit 70
+            trap 'rm -f "${dollar}candidate_file"' EXIT
             while true; do
-              dev=${dollar}(dumpsys input 2>/dev/null | awk -v target="${dollar}target" '
-                /^    [-0-9]+: / { path="" }
-                /^      Path: / { path=${dollar}2 }
-                /^      Descriptor: / {
-                  if (${dollar}2 == target && path != "") { print path; exit }
+              dumpsys input 2>/dev/null | awk '
+                function emit() {
+                  if (path ~ /^\/dev\/input\/event/ && enabled == "true" &&
+                      classes ~ /TOUCH_MT/ && classes !~ /TOUCHPAD/) {
+                    print path "|" name "|" descriptor
+                  }
                 }
-              ')
-              if [ -n "${dollar}dev" ]; then
+                /^    [-0-9]+: / {
+                  emit()
+                  name=${dollar}0
+                  sub(/^    [-0-9]+: /, "", name)
+                  path=""; descriptor=""; classes=""; enabled=""
+                }
+                /^      Classes: / { classes=${dollar}0 }
+                /^      Path: / { path=${dollar}2 }
+                /^      Enabled: / { enabled=${dollar}2 }
+                /^      Descriptor: / { descriptor=${dollar}2 }
+                END { emit() }
+              ' > "${dollar}candidate_file"
+              count=0
+              while IFS='|' read -r dev name descriptor; do
+                [ -n "${dollar}dev" ] || continue
                 range=${dollar}(getevent -lp "${dollar}dev" 2>/dev/null | awk '
                   function clean(value) { gsub(/,/, "", value); return value + 0 }
-                  /ABS_MT_POSITION_X/ {
+                  /ABS_MT_POSITION_X|0035[[:space:]]*:/ {
                     for (i=1; i<=NF; i++) {
                       token=${dollar}i; gsub(/,/, "", token)
                       if (token == "min") xmin=clean(${dollar}(i+1))
                       if (token == "max") xmax=clean(${dollar}(i+1))
                     }
                   }
-                  /ABS_MT_POSITION_Y/ {
+                  /ABS_MT_POSITION_Y|0036[[:space:]]*:/ {
                     for (i=1; i<=NF; i++) {
                       token=${dollar}i; gsub(/,/, "", token)
                       if (token == "min") ymin=clean(${dollar}(i+1))
@@ -7928,12 +7887,17 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
                   }
                 ')
                 if [ -n "${dollar}range" ]; then
-                  echo "DEXTOP_TOUCH_READY=${dollar}dev|${dollar}range"
-                  getevent -lt "${dollar}dev"
-                  echo "DEXTOP_TOUCH_EOF=${dollar}dev"
+                  printf 'DEXTOP_TOUCH_CANDIDATE=%s\t%s\t%s\t%s\n' \
+                    "${dollar}dev" "${dollar}descriptor" "${dollar}name" "${dollar}range"
+                  count=${dollar}((count + 1))
                 else
                   echo "DEXTOP_TOUCH_RANGE_INVALID=${dollar}dev"
                 fi
+              done < "${dollar}candidate_file"
+              if [ "${dollar}count" -gt 0 ]; then
+                echo "DEXTOP_TOUCH_DISCOVERY_DONE=${dollar}count"
+                rm -f "${dollar}candidate_file"
+                exec getevent -lt
               else
                 echo DEXTOP_TOUCH_WAITING
               fi
@@ -7947,7 +7911,8 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
             touchscreenReaderRunning = true
             touchscreenReaderReady = false
             touchscreenReaderDevice = ""
-            touchscreenReaderActiveBinding = null
+            touchscreenReaderActiveDevice = null
+            touchscreenReaderCandidateCount = 0
             rawTouchscreenSuppressUntilAllUp = false
             rawTouchscreenThreeFingerCaptured = false
             rawTouchscreenLastPhysicalContactCount = 0
@@ -7964,7 +7929,7 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
             rawMouseDispatchedEventCount = 0L
             drainLaptopKeyboardPipe(remote.errorStream, "touchscreen_stderr")
             Thread {
-                runRawTouchscreenReader(remote, generation, binding)
+                runRawTouchscreenReader(remote, generation)
             }.apply {
                 name = "DextopTouchscreenReader"
                 isDaemon = true
@@ -7976,7 +7941,7 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
                 }
             }, 4_000L)
             val message = "raw touchscreen reader started generation=$generation " +
-                "requested=${binding.summary()} discovery=descriptor"
+                "discovery=shizuku_eventhub_direct_touch"
             OperationLog.i(this, "InputRouting", message)
             Log.i(logTag, message)
         }.onFailure { error ->
@@ -7988,22 +7953,17 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
 
     private fun runRawTouchscreenReader(
         remote: moe.shizuku.server.IRemoteProcess,
-        generation: Long,
-        binding: RawTouchscreenBinding
+        generation: Long
     ) {
-        val trackingIds = IntArray(RAW_TOUCHSCREEN_MAX_SLOTS) { -1 }
-        val positionsX = IntArray(RAW_TOUCHSCREEN_MAX_SLOTS)
-        val positionsY = IntArray(RAW_TOUCHSCREEN_MAX_SLOTS)
-        val touchMajors = IntArray(RAW_TOUCHSCREEN_MAX_SLOTS)
-        var currentSlot = 0
+        val states = linkedMapOf<String, RawTouchscreenParserState>()
+        var activePath: String? = null
         var failure: Throwable? = null
 
-        fun clearPhysicalSlots() {
-            trackingIds.fill(-1)
-            positionsX.fill(0)
-            positionsY.fill(0)
-            touchMajors.fill(0)
-            currentSlot = 0
+        fun releaseActiveSource(reason: String) {
+            val path = activePath ?: return
+            states[path]?.clear()
+            activePath = null
+            root?.post { onRawTouchscreenSourceReleased(generation, path, reason) }
         }
 
         try {
@@ -8016,44 +7976,43 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
                     touchscreenReaderRunning && generation == touchscreenReaderGeneration
                 }.forEach { line ->
                     when {
-                        line.startsWith("DEXTOP_TOUCH_READY=") -> {
-                            clearPhysicalSlots()
-                            val metadata = line.substringAfter('=').trim().split('|')
-                            if (metadata.size == 5) {
-                                val device = metadata[0]
-                                val minX = metadata[1].toIntOrNull()
-                                val maxX = metadata[2].toIntOrNull()
-                                val minY = metadata[3].toIntOrNull()
-                                val maxY = metadata[4].toIntOrNull()
-                                if (minX != null && maxX != null && minY != null && maxY != null &&
-                                    maxX > minX && maxY > minY) {
-                                    root?.post {
-                                        onRawTouchscreenDeviceReady(
-                                            generation,
-                                            binding,
-                                            device,
-                                            minX,
-                                            maxX,
-                                            minY,
-                                            maxY
-                                        )
-                                    }
-                                }
+                        line.startsWith("DEXTOP_TOUCH_CANDIDATE=") -> {
+                            val metadata = line.substringAfter('=').split('\t')
+                            val range = metadata.getOrNull(3)?.split(':').orEmpty()
+                            val minX = range.getOrNull(0)?.toIntOrNull()
+                            val maxX = range.getOrNull(1)?.toIntOrNull()
+                            val minY = range.getOrNull(2)?.toIntOrNull()
+                            val maxY = range.getOrNull(3)?.toIntOrNull()
+                            val path = metadata.getOrNull(0).orEmpty()
+                            if (path.startsWith("/dev/input/event") &&
+                                minX != null && maxX != null && minY != null && maxY != null &&
+                                maxX > minX && maxY > minY) {
+                                val device = RawTouchscreenDevice(
+                                    path = path,
+                                    descriptor = metadata.getOrNull(1).orEmpty(),
+                                    name = metadata.getOrNull(2).orEmpty(),
+                                    minX = minX,
+                                    maxX = maxX,
+                                    minY = minY,
+                                    maxY = maxY
+                                )
+                                states[path] = RawTouchscreenParserState(device)
+                            }
+                            return@forEach
+                        }
+                        line.startsWith("DEXTOP_TOUCH_DISCOVERY_DONE=") -> {
+                            val devices = states.values.map { it.device }
+                            root?.post {
+                                onRawTouchscreenDiscoveryReady(generation, devices)
                             }
                             return@forEach
                         }
                         line.startsWith("DEXTOP_TOUCH_RANGE_INVALID=") -> {
                             val device = line.substringAfter('=').trim()
                             root?.post {
-                                onRawTouchscreenSourceReset(generation, "invalid_axis_range:$device")
-                            }
-                            return@forEach
-                        }
-                        line.startsWith("DEXTOP_TOUCH_EOF=") -> {
-                            clearPhysicalSlots()
-                            val device = line.substringAfter('=').trim()
-                            root?.post {
-                                onRawTouchscreenSourceReset(generation, "device_eof:$device")
+                                val message = "raw touchscreen rejected invalid axis range path=$device"
+                                OperationLog.w(this, "InputRouting", message)
+                                Log.w(logTag, message)
                             }
                             return@forEach
                         }
@@ -8061,48 +8020,58 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
                     }
                     val fields = line.trim().split(Regex("\\s+"))
                     if (fields.size < 3) return@forEach
+                    val path = fields.firstOrNull { it.startsWith("/dev/input/event") }
+                        ?.removeSuffix(":") ?: return@forEach
+                    val state = states[path] ?: return@forEach
                     val type = fields[fields.size - 3]
                     val code = fields[fields.size - 2]
                     val value = fields.last().toLongOrNull(16)?.toInt() ?: return@forEach
                     when {
                         (type == "EV_ABS" || type == "0003") &&
                             (code == "ABS_MT_SLOT" || code == "002f") -> {
-                            currentSlot = value.coerceIn(0, RAW_TOUCHSCREEN_MAX_SLOTS - 1)
+                            state.currentSlot = value.coerceIn(0, RAW_TOUCHSCREEN_MAX_SLOTS - 1)
                         }
                         (type == "EV_ABS" || type == "0003") &&
                             (code == "ABS_MT_TRACKING_ID" || code == "0039") -> {
-                            trackingIds[currentSlot] = value
+                            state.trackingIds[state.currentSlot] = value
                             if (value < 0) {
-                                touchMajors[currentSlot] = 0
+                                state.touchMajors[state.currentSlot] = 0
+                            } else if (activePath == null) {
+                                activePath = path
+                                states.filterKeys { it != path }.values.forEach { it.clear() }
+                                root?.post {
+                                    onRawTouchscreenSourceSelected(generation, state.device)
+                                }
                             }
                         }
                         (type == "EV_ABS" || type == "0003") &&
                             (code == "ABS_MT_POSITION_X" || code == "0035") -> {
-                            positionsX[currentSlot] = value
+                            state.positionsX[state.currentSlot] = value
                         }
                         (type == "EV_ABS" || type == "0003") &&
                             (code == "ABS_MT_POSITION_Y" || code == "0036") -> {
-                            positionsY[currentSlot] = value
+                            state.positionsY[state.currentSlot] = value
                         }
                         (type == "EV_ABS" || type == "0003") &&
                             (code == "ABS_MT_TOUCH_MAJOR" || code == "0030") -> {
-                            touchMajors[currentSlot] = value
+                            state.touchMajors[state.currentSlot] = value
                         }
                         (type == "EV_SYN" || type == "0000") &&
                             (code == "SYN_REPORT" || code == "0000") -> {
-                            val contacts = trackingIds.indices.mapNotNull { slot ->
-                                val trackingId = trackingIds[slot]
-                                if (trackingId < 0) null else RawTouchscreenContact(
-                                    physicalSlot = slot,
-                                    trackingId = trackingId,
-                                    rawX = positionsX[slot],
-                                    rawY = positionsY[slot],
-                                    touchMajor = touchMajors[slot]
-                                )
+                            if (activePath == path) {
+                                val contacts = state.contacts()
+                                root?.post {
+                                    handleRawTouchscreenFrame(generation, contacts)
+                                }
+                                if (contacts.isEmpty()) {
+                                    releaseActiveSource("all_contacts_up")
+                                }
                             }
-                            root?.post {
-                                handleRawTouchscreenFrame(generation, contacts)
-                            }
+                        }
+                        (type == "EV_SYN" || type == "0000") &&
+                            (code == "SYN_DROPPED" || code == "0003") -> {
+                            states.values.forEach { it.clear() }
+                            releaseActiveSource("syn_dropped")
                         }
                     }
                 }
@@ -8114,32 +8083,19 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         }
     }
 
-    private fun onRawTouchscreenDeviceReady(
+    private fun onRawTouchscreenDiscoveryReady(
         generation: Long,
-        binding: RawTouchscreenBinding,
-        device: String,
-        minX: Int,
-        maxX: Int,
-        minY: Int,
-        maxY: Int
+        devices: List<RawTouchscreenDevice>
     ) {
         if (generation != touchscreenReaderGeneration || !touchscreenReaderRunning) return
-        if (!rawTouchscreenBindingsMatch(touchscreenReaderRequestedBinding, binding)) {
-            invalidateRawTouchscreenBinding("reader_binding_mismatch")
-            return
-        }
-        touchscreenReaderDevice = device
-        touchscreenReaderActiveBinding = binding
-        rawTouchscreenMinX = minX
-        rawTouchscreenMaxX = maxX
-        rawTouchscreenMinY = minY
-        rawTouchscreenMaxY = maxY
-        touchscreenReaderReady = true
-        finishRawPointerGesture("raw_touchscreen_activated")
+        touchscreenReaderCandidateCount = devices.size
+        touchscreenReaderReady = devices.isNotEmpty()
+        if (devices.isEmpty()) return
         val fullscreenBounds = rawTouchscreenViewBounds(surfaceView)
         val trackpadBounds = rawTouchscreenViewBounds(laptopTrackpadView)
-        val message = "raw touchscreen ready generation=$generation path=$device " +
-            "binding=${binding.summary()} rawRange=[$minX..$maxX,$minY..$maxY] " +
+        val candidates = devices.joinToString(prefix = "[", postfix = "]") { it.summary() }
+        val message = "raw touchscreen discovery ready generation=$generation " +
+            "candidateCount=${devices.size} candidates=$candidates " +
             "profile=$virtualPointerRegisteredProfile rotation=${rawTouchscreenDisplayRotation()} " +
             "fullscreenBounds=$fullscreenBounds trackpadBounds=$trackpadBounds " +
             "root=${root?.width ?: 0}x${root?.height ?: 0}"
@@ -8147,20 +8103,49 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         Log.i(logTag, message)
     }
 
-    private fun onRawTouchscreenSourceReset(generation: Long, reason: String) {
-        if (generation != touchscreenReaderGeneration || !touchscreenReaderRunning) return
-        touchscreenReaderReady = false
-        finishRawPointerGesture("raw_source_reset")
+    private fun onRawTouchscreenSourceSelected(
+        generation: Long,
+        device: RawTouchscreenDevice
+    ) {
+        if (generation != touchscreenReaderGeneration || !touchscreenReaderRunning ||
+            !touchscreenReaderReady) return
+        finishRawPointerGesture("raw_source_selected")
         resetRawTouchscreenGestureState()
-        val message = "raw touchscreen source reset generation=$generation reason=$reason"
-        OperationLog.w(this, "InputRouting", message)
-        Log.w(logTag, message)
+        touchscreenReaderActiveDevice = device
+        touchscreenReaderDevice = device.path
+        rawTouchscreenMinX = device.minX
+        rawTouchscreenMaxX = device.maxX
+        rawTouchscreenMinY = device.minY
+        rawTouchscreenMaxY = device.maxY
+        rawTouchscreenLastRotation = rawTouchscreenDisplayRotation()
+        val message = "raw touchscreen gesture source selected generation=$generation " +
+            "${device.summary()} rotation=$rawTouchscreenLastRotation"
+        OperationLog.i(this, "InputRouting", message)
+        Log.i(logTag, message)
+    }
+
+    private fun onRawTouchscreenSourceReleased(
+        generation: Long,
+        path: String,
+        reason: String
+    ) {
+        if (generation != touchscreenReaderGeneration ||
+            touchscreenReaderActiveDevice?.path != path) return
+        val previous = touchscreenReaderActiveDevice
+        touchscreenReaderActiveDevice = null
+        touchscreenReaderDevice = ""
+        val message = "raw touchscreen gesture source released generation=$generation " +
+            "reason=$reason previous=${previous?.summary() ?: path}"
+        OperationLog.i(this, "InputRouting", message)
+        Log.i(logTag, message)
     }
 
     private fun onRawTouchscreenReaderExited(generation: Long, failure: Throwable?) {
         if (generation != touchscreenReaderGeneration || !touchscreenReaderRunning) return
         touchscreenReaderRunning = false
         touchscreenReaderReady = false
+        touchscreenReaderCandidateCount = 0
+        touchscreenReaderActiveDevice = null
         touchscreenReaderProcess = null
         val message = "raw touchscreen reader exited generation=$generation " +
             "path=$touchscreenReaderDevice frames=$rawTouchscreenSourceFrameCount " +
@@ -8321,18 +8306,8 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         physicalContacts: List<RawTouchscreenContact>
     ) {
         if (generation != touchscreenReaderGeneration ||
-            !touchscreenReaderRunning || !touchscreenReaderReady) return
-        if (rawTouchscreenOverlayPrimingGesture) {
-            if (physicalContacts.isEmpty()) {
-                rawTouchscreenOverlayPrimingGesture = false
-                resetRawTouchscreenGestureState()
-                val message = "raw touchscreen discovery contacts released; raw takeover armed " +
-                    "binding=${touchscreenReaderActiveBinding?.summary() ?: "none"}"
-                OperationLog.i(this, "InputRouting", message)
-                Log.i(logTag, message)
-            }
-            return
-        }
+            !touchscreenReaderRunning || !touchscreenReaderReady ||
+            touchscreenReaderActiveDevice == null) return
         if (!rawTouchscreenBridgeConsumesTouchSurface()) return
         rawTouchscreenSourceFrameCount += 1
         val currentRotation = rawTouchscreenDisplayRotation()
@@ -8731,7 +8706,7 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
                 "virtual=${it.x}:${it.y}"
         }
         val message = "raw touchscreen frame state=$state path=$touchscreenReaderDevice " +
-            "binding=${touchscreenReaderActiveBinding?.summary() ?: "none"} " +
+            "device=${touchscreenReaderActiveDevice?.summary() ?: "none"} " +
             "rawRange=[$rawTouchscreenMinX..$rawTouchscreenMaxX," +
             "$rawTouchscreenMinY..$rawTouchscreenMaxY] " +
             "profile=$virtualPointerRegisteredProfile rotation=${rawTouchscreenDisplayRotation()} " +
@@ -8766,13 +8741,13 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         touchscreenReaderGeneration += 1
         touchscreenReaderRunning = false
         touchscreenReaderReady = false
+        touchscreenReaderCandidateCount = 0
         touchscreenReaderProcess?.let { runCatching { it.destroy() } }
         touchscreenReaderProcess = null
         finishRawPointerGesture("raw_reader_stopped")
         resetRawTouchscreenGestureState()
-        rawTouchscreenOverlayPrimingGesture = false
         touchscreenReaderDevice = ""
-        touchscreenReaderActiveBinding = null
+        touchscreenReaderActiveDevice = null
         rawTouchscreenMinX = 0
         rawTouchscreenMaxX = 1
         rawTouchscreenMinY = 0
