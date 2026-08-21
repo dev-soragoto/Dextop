@@ -1,0 +1,216 @@
+package moe.n4tsu.dextop.input
+
+import android.content.ComponentName
+import android.content.Context
+import android.content.ServiceConnection
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.util.Log
+import moe.n4tsu.dextop.BuildConfig
+import rikka.shizuku.Shizuku
+
+/** Main-process controller for the privileged input UserService. */
+internal class PrivilegedInputClient(
+    context: Context,
+    private val listener: Listener
+) {
+    interface Listener {
+        fun onInputState(category: String, message: String)
+        fun onThreeFingerGesture()
+        fun onHaptic(strong: Boolean)
+    }
+
+    companion object {
+        private const val TAG = "DextopInputClient"
+    }
+
+    private val appContext = context.applicationContext
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val args = Shizuku.UserServiceArgs(
+        ComponentName(appContext, PrivilegedInputService::class.java)
+    )
+        .processNameSuffix("dextop_input")
+        .tag("dextop-input-v${PrivilegedInputProtocol.VERSION}")
+        .version(PrivilegedInputProtocol.VERSION)
+        .debuggable(BuildConfig.DEBUG)
+        .daemon(false)
+
+    @Volatile private var remote: IPrivilegedInputService? = null
+    @Volatile private var binding = false
+    @Volatile private var engineRunning = false
+    @Volatile private var released = false
+    private var pendingConfig: IntArray? = null
+    private var keyboardVisible = false
+
+    private val callback = object : IPrivilegedInputCallback.Stub() {
+        override fun onInputState(category: String, message: String) {
+            mainHandler.post { listener.onInputState(category, message) }
+        }
+
+        override fun onThreeFingerGesture() {
+            mainHandler.post { listener.onThreeFingerGesture() }
+        }
+
+        override fun onHaptic(strong: Boolean) {
+            mainHandler.post { listener.onHaptic(strong) }
+        }
+    }
+
+    private val connection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName, binder: IBinder) {
+            binding = false
+            if (released) {
+                runCatching { Shizuku.unbindUserService(args, this, true) }
+                return
+            }
+            val service = IPrivilegedInputService.Stub.asInterface(binder)
+            val protocol = runCatching { service.protocolVersion() }.getOrDefault(-1)
+            if (protocol != PrivilegedInputProtocol.VERSION) {
+                val message = "protocol mismatch client=${PrivilegedInputProtocol.VERSION} service=$protocol"
+                Log.e(TAG, message)
+                listener.onInputState("client_error", message)
+                runCatching { Shizuku.unbindUserService(args, this, true) }
+                return
+            }
+            remote = service
+            val probe = runCatching { service.probe() }
+                .getOrElse { "probe_failed:${it.javaClass.simpleName}:${it.message}" }
+            listener.onInputState("connected", probe)
+            pendingConfig?.let { config ->
+                runCatching {
+                    service.configure(config)
+                    engineRunning = service.start(callback)
+                }.onFailure { error ->
+                    engineRunning = false
+                    listener.onInputState(
+                        "client_error",
+                        "engine start failed ${error.javaClass.simpleName}:${error.message}"
+                    )
+                }
+            }
+            runCatching { service.setKeyboardVisible(keyboardVisible) }
+                .onFailure(::handleRemoteFailure)
+        }
+
+        override fun onServiceDisconnected(name: ComponentName) {
+            binding = false
+            remote = null
+            engineRunning = false
+            listener.onInputState("disconnected", "privileged input UserService disconnected")
+        }
+    }
+
+    fun start(config: IntArray) {
+        released = false
+        pendingConfig = config.copyOf()
+        val service = remote
+        if (service != null) {
+            runCatching {
+                service.configure(config)
+                if (!engineRunning) engineRunning = service.start(callback)
+            }.onFailure(::handleRemoteFailure)
+            return
+        }
+        bind()
+    }
+
+    fun updateConfig(config: IntArray) {
+        pendingConfig = config.copyOf()
+        remote?.let { service ->
+            runCatching { service.configure(config) }.onFailure(::handleRemoteFailure)
+        }
+    }
+
+    fun setOutputReady(ready: Boolean) {
+        remote?.let { service ->
+            runCatching { service.setOutputReady(ready) }.onFailure(::handleRemoteFailure)
+        }
+    }
+
+    fun inject(events: IntArray): Boolean {
+        val service = remote ?: return false
+        return runCatching {
+            service.inject(events)
+            true
+        }.onFailure(::handleRemoteFailure).getOrDefault(false)
+    }
+
+    fun setKeyboardVisible(visible: Boolean) {
+        keyboardVisible = visible
+        val service = remote
+        if (service != null) {
+            runCatching { service.setKeyboardVisible(visible) }.onFailure(::handleRemoteFailure)
+        } else if (visible) {
+            released = false
+            bind()
+        }
+    }
+
+    fun stopEngine(reason: String) {
+        engineRunning = false
+        remote?.let { service ->
+            runCatching { service.stop(reason) }.onFailure(::handleRemoteFailure)
+        }
+    }
+
+    fun snapshot(): String = remote?.let { service ->
+        runCatching { service.snapshot() }.getOrElse {
+            "snapshot_failed:${it.javaClass.simpleName}:${it.message}"
+        }
+    } ?: "disconnected binding=$binding pending=${pendingConfig != null}"
+
+    fun isConnected(): Boolean = remote?.asBinder()?.isBinderAlive == true
+
+    fun isEngineRunning(): Boolean = engineRunning && isConnected()
+
+    fun acknowledgeEngineStopped() {
+        engineRunning = false
+    }
+
+    fun acknowledgeEngineStarted() {
+        engineRunning = isConnected()
+    }
+
+    fun release(reason: String) {
+        released = true
+        pendingConfig = null
+        keyboardVisible = false
+        stopEngine(reason)
+        remote = null
+        binding = false
+        runCatching { Shizuku.unbindUserService(args, connection, true) }
+            .onFailure { Log.w(TAG, "UserService unbind failed reason=$reason", it) }
+    }
+
+    private fun bind() {
+        if (binding || released) return
+        if (!runCatching { Shizuku.pingBinder() }.getOrDefault(false)) {
+            listener.onInputState("client_error", "Shizuku-compatible binder unavailable")
+            return
+        }
+        if (runCatching { Shizuku.isPreV11() }.getOrDefault(true)) {
+            listener.onInputState("client_error", "Shizuku UserService requires server v11+")
+            return
+        }
+        binding = true
+        runCatching { Shizuku.bindUserService(args, connection) }
+            .onFailure { error ->
+                binding = false
+                listener.onInputState(
+                    "client_error",
+                    "UserService bind failed ${error.javaClass.simpleName}:${error.message}"
+                )
+            }
+    }
+
+    private fun handleRemoteFailure(error: Throwable) {
+        Log.e(TAG, "privileged input Binder call failed", error)
+        remote = null
+        engineRunning = false
+        listener.onInputState(
+            "client_error",
+            "Binder call failed ${error.javaClass.simpleName}:${error.message}"
+        )
+    }
+}
