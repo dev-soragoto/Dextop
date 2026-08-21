@@ -2097,6 +2097,10 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         )
     }
 
+    private fun isMenuOverlayVisible(): Boolean {
+        return menu?.visibility == View.VISIBLE && menuScrim?.isClickable == true
+    }
+
     private fun buildPrivilegedInputConfig(profile: String): IntArray {
         val windowBounds = windowManager?.currentWindowMetrics?.bounds
         val hostWidth = root?.width?.takeIf { it > 0 }
@@ -2107,10 +2111,14 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
             ?: surfaceView?.height?.takeIf { it > 0 }
             ?: windowBounds?.height()
             ?: resources.displayMetrics.heightPixels
-        val nativeProfile = when (profile) {
-            "touchpad" -> PrivilegedInputProtocol.PROFILE_TOUCHPAD
-            "mouse" -> PrivilegedInputProtocol.PROFILE_MOUSE
-            else -> PrivilegedInputProtocol.PROFILE_DISABLED
+        val nativeProfile = if (isMenuOverlayVisible()) {
+            PrivilegedInputProtocol.PROFILE_DISABLED
+        } else {
+            when (profile) {
+                "touchpad" -> PrivilegedInputProtocol.PROFILE_TOUCHPAD
+                "mouse" -> PrivilegedInputProtocol.PROFILE_MOUSE
+                else -> PrivilegedInputProtocol.PROFILE_DISABLED
+            }
         }
         val candidate = PrivilegedInputProtocol.buildConfig(
             profile = nativeProfile,
@@ -6328,6 +6336,7 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
                 animate().alpha(1f).setDuration(240).start()
             }
             panel.visibility = View.VISIBLE
+            refreshPrivilegedInputConfig("menu_opened")
             panel.alpha = 0f
             panel.scaleX = .94f
             panel.scaleY = .94f
@@ -6354,6 +6363,7 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
             // to Dextop immediately and must never hit the scrim's reopen click.
             frame.routeTouchesToSurface = true
             menuScrim?.isClickable = false
+            refreshPrivilegedInputConfig("menu_closed")
             menuScrim?.animate()?.alpha(0f)?.setDuration(180)?.start()
             val animation = if (menuUsesLandscapeLayout()) {
                 panel.animate().translationX(-panel.width.toFloat())
