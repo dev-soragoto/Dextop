@@ -39,6 +39,7 @@ import android.os.Binder
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
@@ -655,6 +656,7 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
     private var laptopBaseConfig: Config? = null
     private var privilegedInputStarting = false
     private var privilegedInputConfigGeneration = 0
+    private var lastPrivilegedInputSemanticConfig: IntArray? = null
     @Volatile private var virtualMouseReady = false
     private var virtualMouseDeviceId = -1
     private var virtualPointerRegisteredProfile = ""
@@ -1216,13 +1218,22 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
     private var screenReceiverRegistered = false
     private var suspendedForLockScreen = false
     private var suspendedConfig: Config? = null
+    private var screenLifecycleGeneration = 0
+    private var keyguardLockObservedSinceScreenOff = false
+    private var unlockCandidateSince = 0L
+    private var unlockResumeScheduled = false
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (!active) return
+            Log.i(
+                logTag,
+                "screen lifecycle broadcast action=${intent?.action} " +
+                    "suspended=$suspendedForLockScreen generation=$screenLifecycleGeneration"
+            )
             when (intent?.action) {
                 Intent.ACTION_SCREEN_OFF -> suspendForLockScreen()
-                Intent.ACTION_SCREEN_ON -> waitForConfirmedUnlock()
-                Intent.ACTION_USER_PRESENT -> resumeAfterUnlock()
+                Intent.ACTION_SCREEN_ON -> waitForConfirmedUnlock(screenLifecycleGeneration)
+                Intent.ACTION_USER_PRESENT -> resumeAfterUnlock("user_present")
             }
         }
     }
@@ -1545,6 +1556,9 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
             .commit()
         suspendedForLockScreen = false
         suspendedConfig = null
+        keyguardLockObservedSinceScreenOff = false
+        unlockCandidateSince = 0L
+        unlockResumeScheduled = false
         experimentalMultiTouch = true
         sessionJournal.preparing(
             effectiveConfig.width,
@@ -2098,8 +2112,7 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
             "mouse" -> PrivilegedInputProtocol.PROFILE_MOUSE
             else -> PrivilegedInputProtocol.PROFILE_DISABLED
         }
-        privilegedInputConfigGeneration += 1
-        return PrivilegedInputProtocol.buildConfig(
+        val candidate = PrivilegedInputProtocol.buildConfig(
             profile = nativeProfile,
             rotation = rawTouchscreenDisplayRotation(),
             hostWidth = hostWidth,
@@ -2114,8 +2127,30 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
             debugAllEvents = BuildConfig.DEBUG,
             naturalScroll = virtualMouseNaturalScroll(),
             mouseSensitivity = 1f,
-            generation = privilegedInputConfigGeneration
+            generation = 0
         )
+        val previous = lastPrivilegedInputSemanticConfig
+        val changed = previous == null ||
+            (0 until PrivilegedInputProtocol.CONFIG_SIZE).any { index ->
+                index != PrivilegedInputProtocol.CONFIG_GENERATION &&
+                    previous[index] != candidate[index]
+            }
+        if (changed) {
+            privilegedInputConfigGeneration += 1
+            candidate[PrivilegedInputProtocol.CONFIG_GENERATION] = privilegedInputConfigGeneration
+            lastPrivilegedInputSemanticConfig = candidate.copyOf()
+            Log.i(
+                logTag,
+                "privileged input semantic config changed generation=$privilegedInputConfigGeneration " +
+                    "profile=$profile rotation=${candidate[PrivilegedInputProtocol.CONFIG_ROTATION]} " +
+                    "host=${candidate[PrivilegedInputProtocol.CONFIG_HOST_WIDTH]}x" +
+                    candidate[PrivilegedInputProtocol.CONFIG_HOST_HEIGHT]
+            )
+        } else {
+            candidate[PrivilegedInputProtocol.CONFIG_GENERATION] =
+                checkNotNull(previous)[PrivilegedInputProtocol.CONFIG_GENERATION]
+        }
+        return candidate
     }
 
     private fun refreshPrivilegedInputConfig(reason: String) {
@@ -4626,6 +4661,9 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         overlayLayoutEditing = false
         suspendedForLockScreen = false
         suspendedConfig = null
+        screenLifecycleGeneration += 1
+        unlockResumeScheduled = false
+        unlockCandidateSince = 0L
         setPhoneNavigationDisabled(false)
         releasePhoneRotation(clearSnapshot = true)
         // Detach the accessibility host first. Surface destruction normally
@@ -6149,7 +6187,22 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
     }
 
     private fun suspendForLockScreen() {
-        if (suspendedForLockScreen) return
+        if (suspendedForLockScreen) {
+            screenLifecycleGeneration += 1
+            keyguardLockObservedSinceScreenOff = false
+            unlockCandidateSince = 0L
+            unlockResumeScheduled = false
+            Log.i(
+                logTag,
+                "screen off reaffirmed while suspended; cancelled pending unlock " +
+                    "screenGeneration=$screenLifecycleGeneration"
+            )
+            return
+        }
+        screenLifecycleGeneration += 1
+        keyguardLockObservedSinceScreenOff = false
+        unlockCandidateSince = 0L
+        unlockResumeScheduled = false
         suspendedConfig = Config(targetWidth, targetHeight, density, secureDisplay, showSystemDecorations)
         suspendedForLockScreen = true
         stopHostDisplayMonitor()
@@ -6160,11 +6213,15 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
             .onFailure { Log.e(logTag, "lock-screen settings restoration failed", it) }
         removeWindow()
         targetDisplayId = -1
-        Log.i(logTag, "session suspended; all display and overlay windows removed")
+        Log.i(
+            logTag,
+            "session suspended; all display and overlay windows removed " +
+                "screenGeneration=$screenLifecycleGeneration"
+        )
     }
 
-    private fun resumeAfterUnlock() {
-        if (!suspendedForLockScreen) return
+    private fun resumeAfterUnlock(reason: String) {
+        if (!suspendedForLockScreen || unlockResumeScheduled) return
         val previous = suspendedConfig ?: return
         val bounds = windowManager?.currentWindowMetrics?.bounds
         val config = if (shouldFollowHostDisplay() && bounds != null &&
@@ -6176,28 +6233,83 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
                 resources.configuration.densityDpi
             )
         } else previous
-        // USER_PRESENT is emitted only after credential/biometric unlock, so
-        // Dextop is never recreated over the lock screen or biometric UI.
-        root?.postDelayed({ start(config) }, 250) ?: android.os.Handler(mainLooper)
-            .postDelayed({ start(config) }, 250)
-        Log.i(logTag, "unlock confirmed; session recreation scheduled")
+        val generation = screenLifecycleGeneration
+        unlockResumeScheduled = true
+        Handler(mainLooper).postDelayed({
+            if (!suspendedForLockScreen || !unlockResumeScheduled ||
+                generation != screenLifecycleGeneration) return@postDelayed
+            Log.i(logTag, "unlock resume executing reason=$reason screenGeneration=$generation")
+            start(config)
+        }, 250)
+        Log.i(
+            logTag,
+            "unlock confirmed; session recreation scheduled reason=$reason " +
+                "screenGeneration=$generation"
+        )
     }
 
-    private fun waitForConfirmedUnlock(attempt: Int = 0) {
-        if (!suspendedForLockScreen) return
+    private fun waitForConfirmedUnlock(generation: Int, attempt: Int = 0) {
+        if (!suspendedForLockScreen || unlockResumeScheduled ||
+            generation != screenLifecycleGeneration) return
         val keyguard = getSystemService(KeyguardManager::class.java)
-        if (!keyguard.isDeviceLocked && !keyguard.isKeyguardLocked) {
-            Log.i(logTag, "keyguard reports unlocked after attempt=$attempt")
-            resumeAfterUnlock()
-            return
+        val locked = keyguard.isDeviceLocked || keyguard.isKeyguardLocked
+        val secure = keyguard.isDeviceSecure
+        val interactive = getSystemService(PowerManager::class.java).isInteractive
+        val now = SystemClock.elapsedRealtime()
+        if (locked) {
+            if (!keyguardLockObservedSinceScreenOff) {
+                Log.i(
+                    logTag,
+                    "keyguard lock observed after screen off attempt=$attempt " +
+                        "screenGeneration=$generation"
+                )
+            }
+            keyguardLockObservedSinceScreenOff = true
+            unlockCandidateSince = 0L
+        } else if (interactive && (!secure || keyguardLockObservedSinceScreenOff)) {
+            if (unlockCandidateSince == 0L) {
+                unlockCandidateSince = now
+                Log.i(
+                    logTag,
+                    "unlock candidate observed attempt=$attempt secure=$secure " +
+                        "lockObserved=$keyguardLockObservedSinceScreenOff " +
+                        "screenGeneration=$generation"
+                )
+            }
+            val stableFor = now - unlockCandidateSince
+            if (stableFor >= 750L) {
+                Log.i(
+                    logTag,
+                    "keyguard reports stably unlocked attempt=$attempt stableForMs=$stableFor " +
+                        "screenGeneration=$generation"
+                )
+                resumeAfterUnlock("stable_keyguard_confirmation")
+                return
+            }
+        } else {
+            unlockCandidateSince = 0L
+            if (attempt == 0 || attempt == 4 || attempt == 20) {
+                Log.i(
+                    logTag,
+                    "unlock confirmation waiting attempt=$attempt interactive=$interactive " +
+                        "secure=$secure locked=$locked " +
+                        "lockObserved=$keyguardLockObservedSinceScreenOff " +
+                        "screenGeneration=$generation"
+                )
+            }
         }
         if (attempt < 120) {
-            android.os.Handler(mainLooper).postDelayed(
-                { waitForConfirmedUnlock(attempt + 1) },
+            Handler(mainLooper).postDelayed(
+                { waitForConfirmedUnlock(generation, attempt + 1) },
                 250
             )
         } else {
-            Log.w(logTag, "unlock wait timed out; leaving session suspended")
+            Log.w(
+                logTag,
+                "unlock wait timed out; leaving session suspended " +
+                    "secure=$secure lockObserved=$keyguardLockObservedSinceScreenOff " +
+                    "screenGeneration=$generation"
+            )
         }
     }
 
@@ -7908,6 +8020,9 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
         stopHostDisplayMonitor()
         suspendedForLockScreen = false
         suspendedConfig = null
+        screenLifecycleGeneration += 1
+        unlockResumeScheduled = false
+        unlockCandidateSince = 0L
         if (dragHeld) toggleDrag()
         runCatching { physicalInputRouter.restore() }
             .onFailure { Log.e(logTag, "physical input restoration failed", it) }

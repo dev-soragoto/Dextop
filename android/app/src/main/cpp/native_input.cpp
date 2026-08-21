@@ -162,6 +162,36 @@ Config parseConfig(const std::vector<int>& values) {
     return config;
 }
 
+bool sameRect(const Rect& left, const Rect& right) {
+    return left.left == right.left && left.top == right.top &&
+        left.right == right.right && left.bottom == right.bottom;
+}
+
+bool sameConfigSemantics(const Config& left, const Config& right) {
+    return left.version == right.version && left.profile == right.profile &&
+        left.rotation == right.rotation && left.hostWidth == right.hostWidth &&
+        left.hostHeight == right.hostHeight && sameRect(left.fullscreen, right.fullscreen) &&
+        sameRect(left.trackpad, right.trackpad) && left.directTouch == right.directTouch &&
+        left.laptopMode == right.laptopMode && left.touchpadMaxX == right.touchpadMaxX &&
+        left.touchpadMaxY == right.touchpadMaxY &&
+        left.touchpadResolution == right.touchpadResolution &&
+        left.debugAllEvents == right.debugAllEvents &&
+        left.naturalScroll == right.naturalScroll &&
+        left.mouseSensitivity == right.mouseSensitivity &&
+        left.tapTimeoutMs == right.tapTimeoutMs &&
+        left.doubleTapTimeoutMs == right.doubleTapTimeoutMs &&
+        left.tapSlopFraction == right.tapSlopFraction;
+}
+
+bool configInvalidatesActiveGesture(const Config& left, const Config& right) {
+    return left.profile != right.profile || left.rotation != right.rotation ||
+        left.hostWidth != right.hostWidth || left.hostHeight != right.hostHeight ||
+        !sameRect(left.fullscreen, right.fullscreen) || !sameRect(left.trackpad, right.trackpad) ||
+        left.directTouch != right.directTouch || left.laptopMode != right.laptopMode ||
+        left.touchpadMaxX != right.touchpadMaxX || left.touchpadMaxY != right.touchpadMaxY ||
+        left.touchpadResolution != right.touchpadResolution;
+}
+
 struct PhysicalContact {
     int slot = 0;
     int trackingId = -1;
@@ -358,11 +388,12 @@ private:
     int outputFd_ = -1;
     int keyboardFd_ = -1;
     int appliedGeneration_ = -1;
-    int appliedProfile_ = kProfileDisabled;
-    int appliedResolution_ = 0;
+    Config appliedConfig_;
+    bool hasAppliedConfig_ = false;
 
     Target target_ = Target::NONE;
     bool threeFingerCaptured_ = false;
+    int suppressedPhysicalFd_ = -1;
     std::atomic<int> lastContactCount_{0};
     int64_t gestureStartedAt_ = 0;
     int gestureMaxContacts_ = 0;
@@ -390,6 +421,7 @@ private:
     std::array<int, kMaxVirtualSlots> virtualSlotPhysicalIds_{};
     std::array<int, kMaxVirtualSlots> virtualSlotTrackingIds_{};
     int nextVirtualTrackingId_ = 1;
+    int activeToolKey_ = -1;
 
     std::atomic<uint64_t> rawEvents_{0};
     std::atomic<uint64_t> rawFrames_{0};
@@ -517,6 +549,7 @@ private:
                 if ((ready[static_cast<size_t>(index)].events & (EPOLLERR | EPOLLHUP)) != 0) {
                     state("device_removed", "path=" + it->second->path + " epoll_hup_or_error");
                     if (activeFd_.load() == fd) cleanupGesture("active_device_removed");
+                    if (suppressedPhysicalFd_ == fd) suppressedPhysicalFd_ = -1;
                     epoll_ctl(epollFd_, EPOLL_CTL_DEL, fd, nullptr);
                     devices_.erase(it);
                     deviceCount_.store(static_cast<int>(devices_.size()));
@@ -537,9 +570,24 @@ private:
     void applyConfigIfNeeded() {
         if (!configDirty_.exchange(false)) return;
         const Config cfg = configSnapshot();
-        const bool recreate = outputFd_ < 0 || cfg.profile != appliedProfile_ ||
-            cfg.touchpadResolution != appliedResolution_;
-        cleanupGesture("config_changed");
+        const bool duplicate = hasAppliedConfig_ && sameConfigSemantics(appliedConfig_, cfg);
+        const bool recreate = outputFd_ < 0 || !hasAppliedConfig_ ||
+            cfg.profile != appliedConfig_.profile ||
+            cfg.touchpadMaxX != appliedConfig_.touchpadMaxX ||
+            cfg.touchpadMaxY != appliedConfig_.touchpadMaxY ||
+            cfg.touchpadResolution != appliedConfig_.touchpadResolution;
+        if (duplicate && !recreate) {
+            appliedGeneration_ = cfg.generation;
+            if (cfg.debugAllEvents) {
+                LOGD("config duplicate suppressed generation=%d", cfg.generation);
+            }
+            return;
+        }
+        const bool invalidatesGesture = !hasAppliedConfig_ || recreate ||
+            configInvalidatesActiveGesture(appliedConfig_, cfg);
+        if (invalidatesGesture && (gestureStartedAt_ > 0 || activeFd_.load() >= 0)) {
+            cancelGestureForConfigChange(appliedConfig_, cfg);
+        }
         if (recreate) {
             destroyOutput();
             outputReady_.store(false);
@@ -548,8 +596,12 @@ private:
             }
         }
         appliedGeneration_ = cfg.generation;
-        appliedProfile_ = cfg.profile;
-        appliedResolution_ = cfg.touchpadResolution;
+        appliedConfig_ = cfg;
+        hasAppliedConfig_ = true;
+        std::ostringstream out;
+        out << "generation=" << cfg.generation << " duplicate=" << duplicate
+            << " invalidatesGesture=" << invalidatesGesture << " recreate=" << recreate;
+        state("config_applied", out.str());
     }
 
     void applyKeyboardIfNeeded() {
@@ -590,7 +642,10 @@ private:
         if (cfg.profile == kProfileTouchpad) {
             std::strncpy(setup.name, "Dextop Virtual Touchpad", UINPUT_MAX_NAME_SIZE - 1);
             ok = ok && ioctl(outputFd_, UI_SET_EVBIT, EV_ABS) >= 0;
-            for (const int key : {BTN_LEFT, BTN_RIGHT, BTN_TOUCH}) {
+            for (const int key : {
+                BTN_LEFT, BTN_RIGHT, BTN_TOUCH, BTN_TOOL_FINGER, BTN_TOOL_DOUBLETAP,
+                BTN_TOOL_TRIPLETAP, BTN_TOOL_QUADTAP, BTN_TOOL_QUINTTAP
+            }) {
                 ok = ok && ioctl(outputFd_, UI_SET_KEYBIT, key) >= 0;
             }
             ok = ok && ioctl(outputFd_, UI_SET_PROPBIT, INPUT_PROP_POINTER) >= 0;
@@ -623,6 +678,7 @@ private:
             << " range=" << cfg.touchpadMaxX << "x" << cfg.touchpadMaxY
             << " resolution=" << cfg.touchpadResolution << " fd=" << outputFd_;
         state("uinput_created", out.str());
+        activeToolKey_ = -1;
         return true;
     }
 
@@ -888,6 +944,16 @@ private:
 
     void handleFrame(Device& device, const std::vector<PhysicalContact>& physical) {
         const Config cfg = configSnapshot();
+        if (suppressedPhysicalFd_ >= 0) {
+            if (device.fd == suppressedPhysicalFd_ && physical.empty()) {
+                state(
+                    "gesture_resynchronized",
+                    "path=" + device.path + " all physical contacts released after config change"
+                );
+                suppressedPhysicalFd_ = -1;
+            }
+            return;
+        }
         if (cfg.profile == kProfileDisabled || cfg.version != kProtocolVersion) return;
         const int currentActive = activeFd_.load();
         if (currentActive >= 0 && currentActive != device.fd) return;
@@ -972,6 +1038,16 @@ private:
             virtualSlotPhysicalIds_.begin(), virtualSlotPhysicalIds_.end(), [](int id) { return id >= 0; }));
     }
 
+    int toolKeyForContacts(int count) const {
+        switch (count) {
+            case 1: return BTN_TOOL_FINGER;
+            case 2: return BTN_TOOL_DOUBLETAP;
+            case 3: return BTN_TOOL_TRIPLETAP;
+            case 4: return BTN_TOOL_QUADTAP;
+            default: return count >= 5 ? BTN_TOOL_QUINTTAP : -1;
+        }
+    }
+
     void forwardTouchpad(const std::vector<MappedContact>& contacts, const Config&) {
         const int previousCount = activeVirtualSlots();
         std::set<int> activeIds;
@@ -1004,6 +1080,22 @@ private:
         }
         const int currentCount = activeVirtualSlots();
         if (previousCount == 0 && currentCount > 0) events.push_back(makeEvent(EV_KEY, BTN_TOUCH, 1));
+        const int nextToolKey = toolKeyForContacts(currentCount);
+        if (activeToolKey_ != nextToolKey) {
+            if (activeToolKey_ >= 0) {
+                events.push_back(makeEvent(EV_KEY, static_cast<uint16_t>(activeToolKey_), 0));
+            }
+            if (nextToolKey >= 0) {
+                events.push_back(makeEvent(EV_KEY, static_cast<uint16_t>(nextToolKey), 1));
+            }
+            activeToolKey_ = nextToolKey;
+            state(
+                "touchpad_contact_count",
+                "previous=" + std::to_string(previousCount) +
+                    " current=" + std::to_string(currentCount) +
+                    " toolKey=" + std::to_string(activeToolKey_)
+            );
+        }
         if (touchpadSecondTap_ && leftButtonDown_ && previousCount == 0 && currentCount > 0) {
             events.push_back(makeEvent(EV_KEY, BTN_LEFT, 1));
         }
@@ -1166,6 +1258,10 @@ private:
             virtualSlotTrackingIds_[static_cast<size_t>(slot)] = -1;
         }
         if (!events.empty()) events.push_back(makeEvent(EV_KEY, BTN_TOUCH, 0));
+        if (activeToolKey_ >= 0) {
+            events.push_back(makeEvent(EV_KEY, static_cast<uint16_t>(activeToolKey_), 0));
+            activeToolKey_ = -1;
+        }
         if (leftButtonDown_) {
             events.push_back(makeEvent(EV_KEY, BTN_LEFT, 0));
             leftButtonDown_ = false;
@@ -1176,6 +1272,32 @@ private:
         }
     }
 
+    void cancelGestureForConfigChange(const Config& previous, const Config& next) {
+        const int physicalFd = activeFd_.load();
+        releaseAllOutputState("config_changed", true);
+        if (gestureStartedAt_ > 0 || physicalFd >= 0) {
+            std::ostringstream out;
+            out << "oldGeneration=" << previous.generation
+                << " newGeneration=" << next.generation
+                << " oldProfile=" << previous.profile << " newProfile=" << next.profile
+                << " target=" << targetName(target_) << " physicalFd=" << physicalFd;
+            state("gesture_cancelled", "reason=config_changed " + out.str());
+        }
+        threeFingerCaptured_ = false;
+        lastTapValid_ = false;
+        resetGestureState();
+
+        const auto device = devices_.find(physicalFd);
+        if (physicalFd >= 0 && device != devices_.end() && !device->second->contacts().empty()) {
+            suppressedPhysicalFd_ = physicalFd;
+            state(
+                "gesture_suppressed_until_all_up",
+                "path=" + device->second->path +
+                    " contacts=" + std::to_string(device->second->contacts().size())
+            );
+        }
+    }
+
     void cleanupGesture(const std::string& reason) {
         releaseAllOutputState(reason, true);
         if (gestureStartedAt_ > 0 || activeFd_.load() >= 0) {
@@ -1183,6 +1305,7 @@ private:
         }
         threeFingerCaptured_ = false;
         lastTapValid_ = false;
+        suppressedPhysicalFd_ = -1;
         resetGestureState();
         for (auto& [fd, device] : devices_) {
             (void)fd;
@@ -1199,6 +1322,7 @@ private:
             << " outputFrames=" << outputFrames_.load() << " dropped=" << droppedFrames_.load()
             << " devices=" << deviceCount_.load() << " activeFd=" << activeFd_.load()
             << " contacts=" << lastContactCount_.load() << " leftDown=" << leftButtonDown_
+            << " toolKey=" << activeToolKey_ << " suppressedFd=" << suppressedPhysicalFd_
             << " ready=" << outputReady_.load();
         state("stats", out.str());
     }
@@ -1207,6 +1331,7 @@ private:
         devices_.clear();
         deviceCount_.store(0);
         activeFd_.store(-1);
+        suppressedPhysicalFd_ = -1;
     }
 };
 

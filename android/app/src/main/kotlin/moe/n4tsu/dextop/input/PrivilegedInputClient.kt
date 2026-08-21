@@ -103,11 +103,20 @@ internal class PrivilegedInputClient(
 
     fun start(config: IntArray) {
         released = false
+        val configChanged = !sameSemanticConfig(pendingConfig, config)
         pendingConfig = config.copyOf()
         val service = remote
         if (service != null) {
             runCatching {
-                service.configure(config)
+                if (configChanged || !engineRunning) {
+                    service.configure(config)
+                } else {
+                    Log.d(
+                        TAG,
+                        "suppressed duplicate start config generation=" +
+                            config[PrivilegedInputProtocol.CONFIG_GENERATION]
+                    )
+                }
                 if (!engineRunning) engineRunning = service.start(callback)
             }.onFailure(::handleRemoteFailure)
             return
@@ -116,6 +125,14 @@ internal class PrivilegedInputClient(
     }
 
     fun updateConfig(config: IntArray) {
+        if (sameSemanticConfig(pendingConfig, config)) {
+            Log.d(
+                TAG,
+                "suppressed duplicate config generation=" +
+                    config[PrivilegedInputProtocol.CONFIG_GENERATION]
+            )
+            return
+        }
         pendingConfig = config.copyOf()
         remote?.let { service ->
             runCatching { service.configure(config) }.onFailure(::handleRemoteFailure)
@@ -212,5 +229,20 @@ internal class PrivilegedInputClient(
             "client_error",
             "Binder call failed ${error.javaClass.simpleName}:${error.message}"
         )
+    }
+
+    /**
+     * Generation is diagnostic metadata, not input geometry. Rebuilding an
+     * otherwise identical frame used to cancel the active kernel gesture every
+     * time the overlay observed ACTION_DOWN.
+     */
+    private fun sameSemanticConfig(previous: IntArray?, next: IntArray): Boolean {
+        if (previous == null || previous.size != next.size ||
+            next.size != PrivilegedInputProtocol.CONFIG_SIZE) return false
+        for (index in 0 until PrivilegedInputProtocol.CONFIG_SIZE) {
+            if (index == PrivilegedInputProtocol.CONFIG_GENERATION) continue
+            if (previous[index] != next[index]) return false
+        }
+        return true
     }
 }
