@@ -767,7 +767,7 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
     private var touchscreenReaderDevice = ""
     private var touchscreenReaderCandidateCount = 0
     private var rawTouchscreenTopologyRefreshGeneration = 0L
-    private val privilegedInputClientDelegate = lazy {
+    private val privilegedInputClientDelegate: Lazy<PrivilegedInputClient> = lazy {
         PrivilegedInputClient(this, object : PrivilegedInputClient.Listener {
             override fun onInputState(category: String, message: String) {
                 Log.i(logTag, "privileged input [$category] $message")
@@ -853,7 +853,7 @@ class MirrorService : AccessibilityService(), SurfaceHolder.Callback {
             }
         })
     }
-    private val privilegedInputClient by privilegedInputClientDelegate
+    private val privilegedInputClient: PrivilegedInputClient by privilegedInputClientDelegate
     private var inputManager: InputManager? = null
     private var sensorManager: SensorManager? = null
     private var hingeAngle: Float? = null
